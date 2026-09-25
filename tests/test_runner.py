@@ -9,10 +9,18 @@ import pytest
 from docker.errors import DockerException
 
 from opsscript_gate.cli import build_parser, main, parse_matrix_argument
-from opsscript_gate.models import DistroStatus, RunReport, ShellMode, SingleResult
+from opsscript_gate.discovery import discover_scripts, is_shell_script
+from opsscript_gate.models import DistroStatus, FailureDiagnostic, MultiScriptReport, RunReport, ShellMode, SingleResult
+from opsscript_gate.remediation import generate_remediation_hint, REMEDIATION_RULES
 from opsscript_gate.reporter import (
+    emit_github_annotations,
+    escape_github_data,
+    escape_github_property,
+    format_github_annotations,
     format_github_summary,
     format_json,
+    format_multi_github_summary,
+    format_multi_terminal_table,
     format_terminal_table,
     write_github_step_summary,
 )
@@ -24,6 +32,7 @@ from opsscript_gate.runner import (
     DockerDaemonError,
     ShebangParseResult,
     ShebangStatus,
+    extract_failure_diagnostic,
     extract_snippet,
     get_docker_client,
     inspect_shebang,
@@ -368,7 +377,7 @@ def test_cli_version(capsys):
         main(["--version"])
     assert excinfo.value.code == 0
     captured = capsys.readouterr()
-    assert "0.2.1" in captured.out
+    assert "0.4.1" in captured.out
 
 
 def test_cli_format_markdown_and_table(tmp_path, capsys):
@@ -869,6 +878,9 @@ def test_integration_fail_deps_alpine():
     assert report.all_passed is False
     assert report.results[0].status == DistroStatus.FAIL
     assert report.results[0].exit_code == 127
+    assert report.results[0].diagnostic is not None
+    assert report.results[0].diagnostic.kind == "missing_command"
+    assert report.results[0].diagnostic.command == "apt-get"
 
 
 @pytest.mark.integration
@@ -883,3 +895,1052 @@ def test_integration_missing_bash_alpine(tmp_path):
     assert report.results[0].status == DistroStatus.FAIL
     assert report.results[0].exit_code == 127
     assert "not found" in (report.results[0].output_snippet or "").lower()
+    assert report.results[0].diagnostic is not None
+    assert report.results[0].diagnostic.kind == "missing_command"
+    assert report.results[0].diagnostic.command == "/bin/bash"
+
+
+# ==============================================================================
+# 7. Runtime Failure Diagnostics Tests
+# ==============================================================================
+
+def test_extract_failure_diagnostic_positive_variants():
+    # Alpine-style
+    diag1 = extract_failure_diagnostic("/tmp/target_script.sh: line 4: apt-get: not found", exit_code=127)
+    assert diag1 is not None
+    assert diag1.kind == "missing_command"
+    assert diag1.command == "apt-get"
+    assert diag1.message == "command not found: apt-get"
+
+    # Debian/Ubuntu dash style
+    diag2 = extract_failure_diagnostic("/tmp/target_script.sh: 4: curl: not found", exit_code=127)
+    assert diag2 is not None
+    assert diag2.command == "curl"
+    assert diag2.message == "command not found: curl"
+
+    # Bash style with underscores
+    diag3 = extract_failure_diagnostic("bash: line 4: foo_bar: command not found", exit_code=127)
+    assert diag3 is not None
+    assert diag3.command == "foo_bar"
+    assert diag3.message == "command not found: foo_bar"
+
+    # Ash style direct command
+    diag4 = extract_failure_diagnostic("sh: apt-get: not found", exit_code=127)
+    assert diag4 is not None
+    assert diag4.command == "apt-get"
+
+    # Missing interpreter path
+    diag5 = extract_failure_diagnostic("/bin/sh: line 1: /usr/bin/bash: not found", exit_code=127)
+    assert diag5 is not None
+    assert diag5.command == "/usr/bin/bash"
+    assert diag5.message == "command not found: /usr/bin/bash"
+
+    # Versioned command
+    diag6 = extract_failure_diagnostic("sh: python3.12: not found", exit_code=127)
+    assert diag6 is not None
+    assert diag6.command == "python3.12"
+
+    # Single-quoted and double-quoted variants
+    diag7 = extract_failure_diagnostic("bash: 'my-cmd': command not found", exit_code=127)
+    assert diag7 is not None
+    assert diag7.command == "my-cmd"
+
+    diag8 = extract_failure_diagnostic('sh: "my-cmd": not found', exit_code=127)
+    assert diag8 is not None
+    assert diag8.command == "my-cmd"
+
+    # Multi-line output selects first missing command
+    multiline = "Step 1\nsh: line 2: curl: not found\nsh: line 3: jq: not found\nDone"
+    diag9 = extract_failure_diagnostic(multiline, exit_code=127)
+    assert diag9 is not None
+    assert diag9.command == "curl"
+
+
+def test_extract_failure_diagnostic_negative_rules():
+    # Bare exit 127 with no matching shell output
+    assert extract_failure_diagnostic("Process terminated with 127", exit_code=127) is None
+    assert extract_failure_diagnostic("", exit_code=127) is None
+    assert extract_failure_diagnostic("Unknown fatal error", exit_code=127) is None
+
+    # Application output with arbitrary prefixes or missing shell-origin format
+    assert extract_failure_diagnostic("Error: apt-get: not found", exit_code=127) is None
+    assert extract_failure_diagnostic("myapp: plugin: not found", exit_code=127) is None
+    assert extract_failure_diagnostic("apt-get: not found", exit_code=127) is None
+
+    # Matching output but exit code != 127 (e.g. exit 1 or 2)
+    assert extract_failure_diagnostic("bash: foo: command not found", exit_code=1) is None
+    assert extract_failure_diagnostic("sh: apt-get: not found", exit_code=2) is None
+    assert extract_failure_diagnostic("/tmp/script.sh: line 1: curl: not found", exit_code=None) is None
+
+    # Program merely printing command-not-found-like text
+    assert extract_failure_diagnostic("cat: /etc/hosts: File not found", exit_code=127) is None
+    assert extract_failure_diagnostic("grep: /path/file: No such file or directory", exit_code=127) is None
+    assert extract_failure_diagnostic("Error: database key not found in cache", exit_code=127) is None
+
+    # HTTP status or numeric tokens
+    assert extract_failure_diagnostic("HTTP/1.1 404: not found", exit_code=127) is None
+    assert extract_failure_diagnostic("404: not found", exit_code=127) is None
+    assert extract_failure_diagnostic("error: 1234: not found", exit_code=127) is None
+    assert extract_failure_diagnostic("warning: 0: command not found", exit_code=127) is None
+
+    # Other common errors that must NOT be misclassified as missing_command
+    assert extract_failure_diagnostic("sh: line 10: syntax error: unexpected end of file", exit_code=127) is None
+    assert extract_failure_diagnostic("bash: /path/to/script.sh: Permission denied", exit_code=127) is None
+    assert extract_failure_diagnostic("Status: not found", exit_code=127) is None
+
+    # Pure symbols/dots
+    assert extract_failure_diagnostic(": not found", exit_code=127) is None
+    assert extract_failure_diagnostic("..: not found", exit_code=127) is None
+    assert extract_failure_diagnostic("/: not found", exit_code=127) is None
+    assert extract_failure_diagnostic("//: not found", exit_code=127) is None
+
+
+def test_extract_failure_diagnostic_sanitization_and_unicode():
+    # ANSI escape sequences stripped before matching
+    ansi_text = "\x1b[31mbash: curl: command not found\x1b[0m"
+    diag = extract_failure_diagnostic(ansi_text, exit_code=127)
+    assert diag is not None
+    assert diag.command == "curl"
+    assert diag.message == "command not found: curl"
+
+    # Unicode command identifier
+    unicode_text = "sh: line 1: 测试工具: not found"
+    diag_u = extract_failure_diagnostic(unicode_text, exit_code=127)
+    assert diag_u is not None
+    assert diag_u.command == "测试工具"
+    assert diag_u.message == "command not found: 测试工具"
+
+    # Excessive command name length truncated safely with ellipsis
+    long_cmd = "a" * 150
+    long_text = f"sh: {long_cmd}: not found"
+    diag_long = extract_failure_diagnostic(long_text, exit_code=127)
+    assert diag_long is not None
+    assert len(diag_long.command) == 100
+    assert diag_long.command.endswith("...")
+
+
+def test_run_on_distro_with_diagnostic_mock(tmp_path):
+    script_file = tmp_path / "test_missing.sh"
+    script_file.write_text("#!/bin/sh\napt-get update\n", encoding="utf-8")
+
+    mock_client = mock.MagicMock()
+    mock_container = mock.MagicMock()
+    mock_container.status = "exited"
+    mock_container.attrs = {"State": {"ExitCode": 127}}
+    mock_container.logs.return_value = b"sh: line 2: apt-get: not found\n"
+    mock_client.containers.create.return_value = mock_container
+
+    # Positive: exit 127 + apt-get not found -> sets structured diagnostic
+    res_pos = run_on_distro(mock_client, str(script_file), "alpine:3.20")
+    assert res_pos.status == DistroStatus.FAIL
+    assert res_pos.exit_code == 127
+    assert res_pos.error_message == "Script failed with non-zero exit code: 127"
+    assert res_pos.diagnostic is not None
+    assert res_pos.diagnostic.kind == "missing_command"
+    assert res_pos.diagnostic.command == "apt-get"
+    assert res_pos.diagnostic.message == "command not found: apt-get"
+
+    # Negative 1: exit 127 but no missing command in output -> diagnostic is None
+    mock_container.logs.return_value = b"An unexpected error occurred.\n"
+    res_neg1 = run_on_distro(mock_client, str(script_file), "alpine:3.20")
+    assert res_neg1.status == DistroStatus.FAIL
+    assert res_neg1.exit_code == 127
+    assert res_neg1.diagnostic is None
+    assert res_neg1.error_message == "Script failed with non-zero exit code: 127"
+
+    # Negative 2: exit 1 with 'command not found' output -> diagnostic is None (must be exit 127)
+    mock_container.attrs = {"State": {"ExitCode": 1}}
+    mock_container.logs.return_value = b"sh: line 2: apt-get: not found\n"
+    res_neg2 = run_on_distro(mock_client, str(script_file), "alpine:3.20")
+    assert res_neg2.status == DistroStatus.FAIL
+    assert res_neg2.exit_code == 1
+    assert res_neg2.diagnostic is None
+    assert res_neg2.error_message == "Script failed with non-zero exit code: 1"
+
+
+def test_diagnostic_serialization_backward_compatibility():
+    # With diagnostic
+    res_with_diag = SingleResult(
+        distro="alpine:3.20",
+        status=DistroStatus.FAIL,
+        exit_code=127,
+        duration=0.456,
+        output_snippet="apt-get: not found",
+        error_message="Script failed with non-zero exit code: 127",
+        diagnostic=FailureDiagnostic(
+            kind="missing_command",
+            command="apt-get",
+            message="command not found: apt-get",
+        ),
+    )
+    d = res_with_diag.to_dict()
+    assert d["distro"] == "alpine:3.20"
+    assert d["status"] == "FAIL"
+    assert d["exit_code"] == 127
+    assert d["duration"] == 0.456
+    assert d["output_snippet"] == "apt-get: not found"
+    assert d["error_message"] == "Script failed with non-zero exit code: 127"
+    assert d["diagnostic"] == {
+        "kind": "missing_command",
+        "command": "apt-get",
+        "message": "command not found: apt-get",
+    }
+
+    # Without diagnostic
+    res_without_diag = SingleResult(
+        distro="debian:12-slim",
+        status=DistroStatus.PASS,
+        exit_code=0,
+        duration=1.0,
+    )
+    d2 = res_without_diag.to_dict()
+    assert d2["diagnostic"] is None
+
+
+def test_reporter_rendering_with_diagnostic():
+    res1 = SingleResult(
+        distro="debian:12-slim",
+        status=DistroStatus.PASS,
+        exit_code=0,
+        duration=0.5,
+    )
+    res2 = SingleResult(
+        distro="alpine:3.20",
+        status=DistroStatus.FAIL,
+        exit_code=127,
+        duration=0.2,
+        output_snippet="apt-get: not found",
+        error_message="Script failed with non-zero exit code: 127",
+        diagnostic=FailureDiagnostic(
+            kind="missing_command",
+            command="apt-get",
+            message="command not found: apt-get",
+        ),
+    )
+    res3 = SingleResult(
+        distro="ubuntu:22.04",
+        status=DistroStatus.FAIL,
+        exit_code=1,
+        duration=0.3,
+        error_message="Script failed with non-zero exit code: 1",
+    )
+    report = RunReport(results=[res1, res2, res3], total_duration=1.0)
+
+    # 1. Terminal Table
+    table_output = format_terminal_table(report)
+    assert "command not found: apt-get" in table_output
+    assert "Script failed with non-zero exit code: 1" in table_output
+    assert "OK" in table_output
+
+    # 2. GitHub Summary
+    gh_output = format_github_summary(report)
+    assert "command not found: apt-get" in gh_output
+    assert "> **Diagnostic:** `missing_command` — `command not found: apt-get`" in gh_output
+    assert "> **Error:** Script failed with non-zero exit code: 127" in gh_output
+
+
+# ==============================================================================
+# 9. v0.4.0 New Feature Tests: Line Numbers, Annotations, Remediation, Concurrency, Limits, Discovery
+# ==============================================================================
+
+def test_github_workflow_command_escaping():
+    """Verify GitHub Actions command property and data escaping against injection."""
+    # Property escaping: %, \r, \n, :, ,
+    malicious_prop = "test%name\r\nwith:colons,and,commas"
+    escaped_prop = escape_github_property(malicious_prop)
+    assert "\r" not in escaped_prop
+    assert "\n" not in escaped_prop
+    assert ":" not in escaped_prop.replace("%3A", "")
+    assert "," not in escaped_prop.replace("%2C", "")
+    assert escaped_prop == "test%25name%0D%0Awith%3Acolons%2Cand%2Ccommas"
+
+    # Data escaping: %, \r, \n
+    malicious_data = "line1\r\nline2%value::set-output"
+    escaped_data = escape_github_data(malicious_data)
+    assert "%0D%0A" in escaped_data
+    assert "%25value" in escaped_data
+    assert "\n" not in escaped_data
+    assert "\r" not in escaped_data
+
+
+def test_format_github_annotations():
+    """Verify format_github_annotations outputs valid ::error lines with optional line numbers."""
+    r1 = SingleResult(
+        distro="alpine:3.20",
+        status=DistroStatus.FAIL,
+        exit_code=127,
+        duration=0.5,
+        diagnostic=FailureDiagnostic(
+            kind="missing_command",
+            command="apt-get",
+            message="command not found: apt-get",
+            line=4,
+            distro="alpine:3.20",
+            hint="Alpine normally uses apk instead of apt-get.",
+        ),
+    )
+    r2 = SingleResult(
+        distro="ubuntu:24.04",
+        status=DistroStatus.FAIL,
+        exit_code=127,
+        duration=0.4,
+        diagnostic=FailureDiagnostic(
+            kind="missing_command",
+            command="apk",
+            message="command not found: apk",
+            line=None,
+            distro="ubuntu:24.04",
+            hint="Debian/Ubuntu normally uses APT (apt-get) instead of apk.",
+        ),
+    )
+    r3 = SingleResult(
+        distro="debian:12-slim",
+        status=DistroStatus.PASS,
+        exit_code=0,
+        duration=0.3,
+    )
+    report = RunReport(results=[r1, r2, r3], total_duration=1.2)
+
+    annotations = format_github_annotations(report, script_path="scripts/deploy.sh")
+    assert len(annotations) == 2
+
+    # verify leading ./ normalization
+    ann_dot_slash = format_github_annotations(report, script_path="./scripts/deploy.sh")
+    assert ann_dot_slash[0].startswith("::error file=scripts/deploy.sh,line=4,title=")
+
+    # r1 should include line=4
+    assert annotations[0].startswith("::error file=scripts/deploy.sh,line=4,title=")
+    assert "apt-get" in annotations[0]
+    assert "Alpine normally uses apk instead of apt-get." in annotations[0]
+
+    # r2 has no line, so no line= in properties
+    assert annotations[1].startswith("::error file=scripts/deploy.sh,title=")
+    assert "line=" not in annotations[1].split("title=")[0]
+    assert "apk" in annotations[1]
+
+    # PASS distro produces no annotation
+    assert not any("debian" in ann for ann in annotations)
+
+
+def test_emit_github_annotations_respects_environment(capsys):
+    """Verify emit_github_annotations only emits to stdout when GITHUB_ACTIONS == 'true'."""
+    r = SingleResult(
+        distro="alpine:3.20",
+        status=DistroStatus.FAIL,
+        exit_code=127,
+        duration=0.5,
+        diagnostic=FailureDiagnostic(
+            kind="missing_command",
+            command="curl",
+            message="command not found: curl",
+        ),
+    )
+    report = RunReport(results=[r], total_duration=0.5)
+
+    # When not in CI, stdout must remain completely clean
+    with mock.patch.dict(os.environ, {}, clear=True):
+        emit_github_annotations(report, script_path="test.sh")
+        captured = capsys.readouterr()
+        assert captured.out == ""
+
+    # When in GitHub Actions CI
+    with mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}):
+        emit_github_annotations(report, script_path="test.sh")
+        captured = capsys.readouterr()
+        assert "::error file=test.sh,title=" in captured.out
+
+
+def test_remediation_rules_logic():
+    """Verify conservative remediation hint generation logic."""
+    # Alpine apt / apt-get
+    hint_apt = generate_remediation_hint("alpine:3.20", "apt-get")
+    assert hint_apt == "Alpine normally uses apk instead of apt-get."
+    hint_apt2 = generate_remediation_hint("alpine:edge", "apt")
+    assert hint_apt2 == "Alpine normally uses apk instead of apt-get."
+
+    # Debian / Ubuntu apk
+    hint_apk_deb = generate_remediation_hint("debian:12-slim", "apk")
+    assert hint_apk_deb == "Debian/Ubuntu normally uses APT (apt-get) instead of apk."
+    hint_apk_ubu = generate_remediation_hint("ubuntu:22.04", "apk")
+    assert hint_apk_ubu == "Debian/Ubuntu normally uses APT (apt-get) instead of apk."
+
+    # Alpine bash
+    hint_bash = generate_remediation_hint("alpine:3.20", "bash")
+    assert "Alpine minimal images do not include Bash by default" in hint_bash
+
+    # curl and wget
+    hint_curl = generate_remediation_hint("ubuntu:24.04", "curl")
+    assert "Minimal images may not include curl" in hint_curl
+    hint_wget = generate_remediation_hint("debian:12-slim", "wget")
+    assert "Minimal images may not include wget" in hint_wget
+
+    # missing interpreter
+    hint_interp = generate_remediation_hint(None, "/usr/bin/bash", kind="missing_interpreter")
+    assert "Ensure the required interpreter is installed" in hint_interp
+
+    # Unrecognized command returns None
+    assert generate_remediation_hint("ubuntu:24.04", "custom-cli") is None
+
+
+def test_extract_failure_diagnostic_line_number_and_hint():
+    """Verify line number extraction and remediation hint binding in diagnostic."""
+    output_with_line = (
+        "Configuring system...\n"
+        "sh: line 14: apt-get: not found\n"
+        "Failed!\n"
+    )
+    diag = extract_failure_diagnostic(output_with_line, exit_code=127, distro="alpine:3.20")
+    assert diag is not None
+    assert diag.command == "apt-get"
+    assert diag.line == 14
+    assert diag.distro == "alpine:3.20"
+    assert diag.hint == "Alpine normally uses apk instead of apt-get."
+
+    # dash style: dash: 3: curl: not found
+    output_dash = "dash: 3: curl: not found\n"
+    diag_dash = extract_failure_diagnostic(output_dash, exit_code=127, distro="debian:12-slim")
+    assert diag_dash is not None
+    assert diag_dash.command == "curl"
+    assert diag_dash.line == 3
+    assert "curl" in (diag_dash.hint or "")
+
+    # script path style: /tmp/target_script.sh: line 7: jq: not found
+    output_path = "/tmp/target_script.sh: line 7: jq: not found\n"
+    diag_path = extract_failure_diagnostic(output_path, exit_code=127, distro="ubuntu:22.04")
+    assert diag_path is not None
+    assert diag_path.command == "jq"
+    assert diag_path.line == 7
+    assert diag_path.hint is None  # no conservative hint for jq
+
+    # without line number
+    output_no_line = "bash: foo: command not found\n"
+    diag_no_line = extract_failure_diagnostic(output_no_line, exit_code=127, distro="ubuntu:24.04")
+    assert diag_no_line is not None
+    assert diag_no_line.command == "foo"
+    assert diag_no_line.line is None
+
+
+def test_run_matrix_concurrency_and_order_preservation(tmp_path):
+    """Verify run_matrix concurrency with ThreadPoolExecutor and strict output ordering."""
+    script_file = tmp_path / "test_concurrent.sh"
+    script_file.write_text("#!/bin/sh\necho OK\nexit 0\n", encoding="utf-8")
+
+    matrix = ["distro_a", "distro_b", "distro_c", "distro_d"]
+    mock_client = mock.MagicMock()
+
+    import time
+    # Simulate completion in reverse order (distro_d finishes first, distro_a last)
+    delays = {"distro_a": 0.04, "distro_b": 0.03, "distro_c": 0.02, "distro_d": 0.01}
+
+    def fake_run_on_distro(**kwargs):
+        d = kwargs["distro"]
+        time.sleep(delays[d])
+        return SingleResult(
+            distro=d,
+            status=DistroStatus.PASS,
+            exit_code=0,
+            duration=delays[d],
+        )
+
+    with mock.patch("opsscript_gate.runner.run_on_distro", side_effect=fake_run_on_distro):
+        report = run_matrix(
+            script_path=str(script_file),
+            matrix=matrix,
+            jobs=4,
+            client=mock_client,
+        )
+
+    assert report.all_passed is True
+    assert len(report.results) == 4
+    # Crucial assertion: results MUST match the original matrix sequence exactly
+    assert [r.distro for r in report.results] == matrix
+
+
+def test_run_on_distro_resource_limits(tmp_path):
+    """Verify mem_limit, pids_limit, and network_mode parameters are forwarded to Docker container."""
+    script_file = tmp_path / "test_limits.sh"
+    script_file.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+
+    mock_client = mock.MagicMock()
+    mock_container = mock.MagicMock()
+    mock_container.status = "exited"
+    mock_container.attrs = {"State": {"ExitCode": 0}}
+    mock_container.logs.return_value = b""
+    mock_client.containers.create.return_value = mock_container
+
+    run_on_distro(
+        client=mock_client,
+        script_path=str(script_file),
+        distro="alpine:3.20",
+        mem_limit="128m",
+        pids_limit=64,
+        network="none",
+    )
+
+    create_kwargs = mock_client.containers.create.call_args[1]
+    assert create_kwargs["mem_limit"] == "128m"
+    assert create_kwargs["pids_limit"] == 64
+    assert create_kwargs["network_mode"] == "none"
+
+
+def test_script_discovery(tmp_path):
+    """Verify discover_scripts detects valid scripts and ignores blacklisted directories and oversized files."""
+    # Top-level shell script
+    (tmp_path / "setup.sh").write_text("#!/bin/sh\necho setup\n", encoding="utf-8")
+    # Subdirectory bash script
+    subdir = tmp_path / "scripts"
+    subdir.mkdir()
+    (subdir / "deploy.bash").write_text("#!/bin/bash\necho deploy\n", encoding="utf-8")
+    # Script without extension but with shebang
+    (tmp_path / "entrypoint").write_text("#!/bin/sh\necho run\n", encoding="utf-8")
+    # Python script (should be ignored)
+    (tmp_path / "server.py").write_text("#!/usr/bin/env python3\nprint('py')\n", encoding="utf-8")
+    # Ignored directory .git
+    git_dir = tmp_path / ".git"
+    git_dir.mkdir()
+    (git_dir / "hook.sh").write_text("#!/bin/sh\necho hook\n", encoding="utf-8")
+    # Ignored directory node_modules
+    nm_dir = tmp_path / "node_modules"
+    nm_dir.mkdir()
+    # Ignored directory vendor
+    vendor_dir = tmp_path / "vendor"
+    vendor_dir.mkdir()
+    (vendor_dir / "lib.sh").write_text("#!/bin/sh\necho vendor\n", encoding="utf-8")
+    # Ignored directory target
+    target_dir = tmp_path / "target"
+    target_dir.mkdir()
+    (target_dir / "artifact.sh").write_text("#!/bin/sh\necho target\n", encoding="utf-8")
+    # Empty script (should be ignored)
+    (tmp_path / "empty.sh").write_text("", encoding="utf-8")
+
+    discovered = discover_scripts(str(tmp_path))
+
+    # Expect setup.sh, entrypoint, and scripts/deploy.bash
+    assert len(discovered) == 3
+    assert any("setup.sh" in p for p in discovered)
+    assert any("deploy.bash" in p for p in discovered)
+    assert any("entrypoint" in p for p in discovered)
+    # Ensure ignored directories are not included
+    assert not any(".git" in p for p in discovered)
+    assert not any("node_modules" in p for p in discovered)
+    assert not any("vendor" in p for p in discovered)
+    assert not any("target" in p for p in discovered)
+    assert not any("server.py" in p for p in discovered)
+
+
+def test_multi_script_report_formatting():
+    """Verify MultiScriptReport model and markdown/table formatting."""
+    r1 = RunReport(
+        results=[SingleResult("alpine:3.20", DistroStatus.PASS, 0, 0.2)],
+        total_duration=0.2,
+    )
+    r2 = RunReport(
+        results=[
+            SingleResult(
+                "debian:12-slim",
+                DistroStatus.FAIL,
+                127,
+                0.3,
+                diagnostic=FailureDiagnostic(
+                    kind="missing_command",
+                    command="apk",
+                    message="command not found: apk",
+                    line=2,
+                    distro="debian:12-slim",
+                    hint="Debian/Ubuntu normally uses APT (apt-get) instead of apk.",
+                ),
+            )
+        ],
+        total_duration=0.3,
+    )
+    multi_report = MultiScriptReport(
+        reports={"setup.sh": r1, "deploy.sh": r2},
+        total_duration=0.5,
+    )
+
+    assert multi_report.all_passed is False
+    d = multi_report.to_dict()
+    assert d["all_passed"] is False
+    assert "setup.sh" in d["reports"]
+    assert "deploy.sh" in d["reports"]
+
+    # Test multi github summary
+    summary_md = format_multi_github_summary(multi_report)
+    assert "Multi-Script Compatibility Report" in summary_md
+    assert "setup.sh" in summary_md
+    assert "deploy.sh" in summary_md
+    assert "1 / 2 Scripts Passed" in summary_md
+
+    # Test multi terminal table
+    table_str = format_multi_terminal_table(multi_report)
+    assert "Target: setup.sh" in table_str
+    assert "Target: deploy.sh" in table_str
+    assert "SOME FAILED" in table_str
+
+
+def test_cli_auto_discovery_execution(tmp_path, monkeypatch):
+    """Verify CLI auto-discovery triggers when script_path is omitted."""
+    script_file = tmp_path / "auto_run.sh"
+    script_file.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+
+    mock_report = RunReport(
+        results=[SingleResult("debian:12-slim", DistroStatus.PASS, 0, 0.1)],
+        total_duration=0.1,
+    )
+
+    monkeypatch.chdir(tmp_path)
+    with mock.patch("opsscript_gate.cli.run_matrix", return_value=mock_report) as mock_rm:
+        exit_code = main(["run"])
+        assert exit_code == 0
+        mock_rm.assert_called_once()
+        # Verify script_path passed was the auto-discovered script
+        called_script = mock_rm.call_args[1]["script_path"]
+        assert "auto_run.sh" in called_script
+
+
+# ==============================================================================
+# 10. v0.4.1 Security Hardening and Adversarial Test Suite
+# ==============================================================================
+
+from pathlib import Path
+import re
+from opsscript_gate.runner import (
+    MAX_CAPTURED_LOG_BYTES,
+    MAX_LOG_TAIL_LINES,
+    MAX_SHEBANG_BYTES,
+    SCRIPT_READ_CHUNK_SIZE,
+    collect_container_logs,
+    sanitize_log_output,
+    _resolve_shell_command,
+)
+from opsscript_gate.reporter import (
+    escape_inline_code,
+    escape_markdown_text,
+    escape_markdown_table_cell,
+    escape_html_text,
+    format_safe_code_fence,
+    format_markdown_compatibility_card,
+    write_github_step_summary,
+)
+from opsscript_gate.cli import build_parser
+
+
+def test_collect_container_logs_bounded_rolling_buffer():
+    """Verify bounded rolling buffer caps retained memory and drops older bytes."""
+    # Create a mock container returning a generator of chunks exceeding MAX_CAPTURED_LOG_BYTES
+    chunk_size = 50 * 1024  # 50 KiB
+    num_chunks = 10  # 500 KiB total > 256 KiB cap
+
+    class MockStreamContainer:
+        def logs(self, stdout=True, stderr=True, tail=None, stream=False):
+            assert stream is True
+            assert tail == MAX_LOG_TAIL_LINES
+            for i in range(num_chunks):
+                yield f"CHUNK-{i:02d}: " + ("x" * (chunk_size - 10))
+
+    container = MockStreamContainer()
+    result = collect_container_logs(container, max_bytes=MAX_CAPTURED_LOG_BYTES)
+
+    assert len(result.encode("utf-8")) <= MAX_CAPTURED_LOG_BYTES
+    # Ensure newest chunk is retained while oldest chunk was rolled out
+    assert "CHUNK-09:" in result
+    assert "CHUNK-00:" not in result
+
+
+def test_collect_container_logs_fallback_handling():
+    """Verify failure during streaming returns bounded partial data or empty string without non-streaming calls."""
+    class MockFailingContainer:
+        def __init__(self):
+            self.non_streaming_called = False
+
+        def logs(self, stdout=True, stderr=True, tail=None, stream=False):
+            if not stream:
+                self.non_streaming_called = True
+                return b"SHOULD_NOT_BE_CALLED"
+            # Generator that yields one chunk then fails
+            def _stream():
+                yield "PARTIAL_LOG"
+                raise RuntimeError("connection aborted")
+            return _stream()
+
+    container = MockFailingContainer()
+    result = collect_container_logs(container, max_bytes=MAX_CAPTURED_LOG_BYTES)
+    # Must return already captured bounded partial data
+    assert result == "PARTIAL_LOG"
+    # Must NOT issue a non-streaming logs call
+    assert container.non_streaming_called is False
+
+
+def test_sanitize_log_output_neutralizes_workflow_commands():
+    """
+    Verify untrusted container logs cannot forge GitHub Actions workflow commands.
+    Line-leading '::' must be neutralized so Runner ignores them,
+    while OpsScript Gate's own annotations remain valid.
+    """
+    forged_log = (
+        "::error file=fake.sh,line=1::forged error message\n"
+        "normal log line\n"
+        "::warning::fake warning\n"
+        "echo a::b\n"
+        "::set-output name=admin::true"
+    )
+    sanitized = sanitize_log_output(forged_log)
+
+    # Verify no line starts with '::'
+    for line in sanitized.splitlines():
+        assert not line.startswith("::"), f"Line starts with workflow command marker: {line}"
+
+    # Verify the contents were preserved with harmless prefix
+    assert "[container] ::error file=fake.sh,line=1::forged error message" in sanitized
+    assert "[container] ::warning::fake warning" in sanitized
+    assert "[container] ::set-output name=admin::true" in sanitized
+    # Non-line-leading '::' should remain intact
+    assert "echo a::b" in sanitized
+
+    # Verify OpsScript Gate's legitimate annotations are NOT affected
+    report = RunReport(
+        results=[
+            SingleResult(
+                distro="alpine:3.20",
+                status=DistroStatus.FAIL,
+                exit_code=127,
+                duration=0.1,
+                diagnostic=FailureDiagnostic(
+                    kind="missing_command",
+                    command="bash",
+                    message="command not found: bash",
+                    line=5,
+                ),
+            )
+        ],
+        total_duration=0.1,
+    )
+    legit_ann = format_github_annotations(report, "test.sh")
+    assert len(legit_ann) == 1
+    assert legit_ann[0].startswith("::error file=test.sh,line=5,title=")
+
+
+def test_sanitize_log_output_ansi_and_control_chars():
+    """Verify ANSI escape sequences, C0 control characters, and CR overwrites are sanitized."""
+    raw = (
+        "\x1b[2J\x1b[1;1H"          # ANSI clear screen and move cursor
+        "\x1b[31;1mRed Alert\x1b[0m\n" # Colors
+        "\x1b]0;Title Hijack\x07"   # OSC title set
+        "Overwritten\rKept Line\n"  # Standalone CR
+        "Bell\x07 and Backspace\x08 and Del\x7f\n"
+        "Tabs\tand Newlines\nare preserved.\n"
+        "Unicode: 成功 ✅ 日本語"
+    )
+    sanitized = sanitize_log_output(raw)
+
+    assert "\x1b" not in sanitized
+    assert "\x07" not in sanitized
+    assert "\x08" not in sanitized
+    assert "\x7f" not in sanitized
+    assert "\r" not in sanitized
+    assert "Tabs\tand Newlines\nare preserved." in sanitized
+    assert "Unicode: 成功 ✅ 日本語" in sanitized
+    assert "Title Hijack" not in sanitized
+    assert "Red Alert" in sanitized
+
+
+def test_prepare_script_bounded_streaming_crlf(tmp_path):
+    """Verify bounded streaming CRLF conversion across chunk boundaries while preserving lone CR."""
+    # 1. CRLF split across chunk boundaries (with chunk_size=10)
+    # Byte 9 is '\r', Byte 10 is '\n'
+    split_crlf_content = b"012345678\r\n012345678\r\n"
+    f1 = tmp_path / "split_crlf.sh"
+    f1.write_bytes(split_crlf_content)
+
+    norm_path, temp_file = prepare_script(str(f1), chunk_size=10)
+    assert temp_file is not None
+    try:
+        content = Path(norm_path).read_bytes()
+        assert b"\r" not in content
+        assert content == b"012345678\n012345678\n"
+    finally:
+        temp_file.close()
+        if os.path.exists(temp_file.name):
+            os.remove(temp_file.name)
+
+    # 2. Lone CR at boundary (must NOT be corrupted)
+    lone_cr_content = b"012345678\rabcdefghij"
+    f2 = tmp_path / "lone_cr.sh"
+    f2.write_bytes(lone_cr_content)
+
+    norm_path2, temp_file2 = prepare_script(str(f2), chunk_size=10)
+    # Lone CR should either not trigger conversion or be preserved
+    if temp_file2 is not None:
+        try:
+            assert Path(norm_path2).read_bytes() == lone_cr_content
+        finally:
+            temp_file2.close()
+            if os.path.exists(temp_file2.name):
+                os.remove(temp_file2.name)
+    else:
+        assert norm_path2 == str(f2)
+
+    # 3. Clean LF script (no temp file created)
+    f3 = tmp_path / "clean_lf.sh"
+    f3.write_bytes(b"#!/bin/sh\necho ok\n")
+    clean_path, clean_temp = prepare_script(str(f3))
+    assert clean_temp is None
+    assert clean_path == str(f3)
+
+
+def test_inspect_shebang_bounded_line_length(tmp_path):
+    """Verify inspect_shebang reads at most MAX_SHEBANG_BYTES + 1 and safely marks oversized lines as MALFORMED."""
+    # 1. Exactly 4096-byte shebang line with newline
+    exact_line = b"#!" + b"/bin/bash " + (b"x" * (MAX_SHEBANG_BYTES - 13)) + b"\n"
+    f1 = tmp_path / "exact_shebang.sh"
+    f1.write_bytes(exact_line)
+    res1 = inspect_shebang(str(f1))
+    # It shouldn't crash or fail with length error
+    assert res1.status in (ShebangStatus.UNSUPPORTED, ShebangStatus.MALFORMED)
+    assert "exceeds maximum allowed length" not in (res1.error_message or "")
+
+    # 2. Oversized shebang line exceeding 4096 bytes without newline
+    oversized_line = b"#!" + (b"A" * (MAX_SHEBANG_BYTES + 100))
+    f2 = tmp_path / "oversized_shebang.sh"
+    f2.write_bytes(oversized_line)
+    res2 = inspect_shebang(str(f2))
+    assert res2.status == ShebangStatus.MALFORMED
+    assert f"exceeds maximum allowed length of {MAX_SHEBANG_BYTES} bytes" in res2.error_message
+
+
+def test_reporter_context_sensitive_escaping():
+    """Verify reporter context-sensitive escaping functions."""
+    # 1. escape_inline_code
+    assert escape_inline_code("foo`bar\r\nbaz`") == "foo'bar baz'"
+
+    # 2. escape_markdown_text
+    evil_md = "# Title\n> Quote\n[Click](http://evil.com)\n<script>alert(1)</script>\nnon-zero"
+    safe_md = escape_markdown_text(evil_md)
+    assert "\\# Title" in safe_md
+    assert "\\> Quote" in safe_md or "&gt; Quote" in safe_md
+    assert "\\[Click\\]\\(http://evil.com\\)" in safe_md
+    assert "&lt;script&gt;" in safe_md
+    assert "non-zero" in safe_md  # Normal hyphens preserved
+
+    # 3. escape_markdown_table_cell
+    assert escape_markdown_table_cell("col1 | col2\r\nrow2") == "col1 \\| col2 row2"
+
+    # 4. escape_html_text
+    assert escape_html_text('<summary>"Evil & Co"</summary>') == '&lt;summary&gt;&quot;Evil &amp; Co&quot;&lt;/summary&gt;'
+
+    # 5. format_safe_code_fence
+    snippet_with_backticks = "Some log with ``` and </details>"
+    fence_lines = format_safe_code_fence(snippet_with_backticks)
+    assert fence_lines[0].startswith("````")  # Uses 4 backticks
+    assert "<\\/details>" in fence_lines[1]
+    assert fence_lines[2].startswith("````")
+
+
+def test_reporter_rendering_adversarial_payloads():
+    """Verify format_markdown_compatibility_card survives adversarial field injections."""
+    adversarial_result = SingleResult(
+        distro='ubuntu:22.04`<script>alert(1)</script>`|',
+        status=DistroStatus.FAIL,
+        exit_code=127,
+        duration=0.5,
+        output_snippet='```\noutput containing ``` prematurely and </details>\n```',
+        error_message='Error with | pipe and \n newline and [Fake Link](http://evil.com)',
+        diagnostic=FailureDiagnostic(
+            kind="missing_command`",
+            command="evil`cmd|",
+            message="cmd`not found\n# Injected Heading",
+            line=10,
+            hint="Use | pipe or `cmd` or [Doc](http://evil.com)",
+        ),
+    )
+    report = RunReport(results=[adversarial_result], total_duration=0.5)
+    summary_md = format_markdown_compatibility_card(report, script_path="hack`script.sh|")
+
+    # Table structure remains intact (no raw unescaped pipes breaking the row)
+    assert "`hack'script.sh\\|`" in summary_md or "\\|" in summary_md
+    assert "<\\/details>" in summary_md
+    assert "</details></details>" not in summary_md
+    assert "\\[Fake Link\\]\\(http://evil.com\\)" in summary_md or "Fake Link" in summary_md
+
+
+def test_run_matrix_shared_temp_cleanup(tmp_path):
+    """Verify run_matrix prepares CRLF script once and cleans up shared temp file."""
+    crlf_script = tmp_path / "matrix_crlf.sh"
+    crlf_script.write_bytes(b"#!/bin/sh\r\necho running\r\n")
+
+    captured_prepared_paths = []
+
+    def mock_run_on_distro(**kwargs):
+        prepared = kwargs.get("prepared_script_path")
+        captured_prepared_paths.append(prepared)
+        return SingleResult(distro=kwargs["distro"], status=DistroStatus.PASS, exit_code=0, duration=0.1)
+
+    with mock.patch("opsscript_gate.runner.run_on_distro", side_effect=mock_run_on_distro):
+        with mock.patch("opsscript_gate.runner.get_docker_client"):
+            report = run_matrix(str(crlf_script), matrix=["debian:12-slim", "alpine:3.20"], jobs=2)
+
+    assert report.all_passed is True
+    assert len(captured_prepared_paths) == 2
+    # Both workers received the exact same prepared temp path
+    assert captured_prepared_paths[0] == captured_prepared_paths[1]
+    assert captured_prepared_paths[0] != str(crlf_script)
+    # Shared temp file must be cleaned up after matrix finishes
+    assert not os.path.exists(captured_prepared_paths[0])
+
+
+def test_write_github_step_summary_branches(tmp_path, monkeypatch):
+    """Test write_github_step_summary handling when env var is missing, valid, or unwritable."""
+    report = RunReport(
+        results=[SingleResult("debian:12-slim", DistroStatus.PASS, 0, 0.1)],
+        total_duration=0.1,
+    )
+
+    # 1. Unset
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+    assert write_github_step_summary(report) is False
+
+    # 2. Valid path
+    summary_file = tmp_path / "step_summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary_file))
+    assert write_github_step_summary(report) is True
+    assert summary_file.exists()
+    assert "OpsScript Gate Compatibility Report" in summary_file.read_text(encoding="utf-8")
+
+    # 3. Unwritable path (directory instead of file)
+    unwritable_dir = tmp_path / "unwritable_dir"
+    unwritable_dir.mkdir()
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(unwritable_dir))
+    assert write_github_step_summary(report) is False
+
+
+def test_get_docker_client_generic_exception():
+    """Verify get_docker_client wraps arbitrary generic exceptions in DockerDaemonError."""
+    with mock.patch("docker.from_env", side_effect=Exception("Permission denied /var/run/docker.sock")):
+        with pytest.raises(DockerDaemonError) as exc_info:
+            get_docker_client()
+        assert "Unexpected error connecting to Docker daemon" in str(exc_info.value)
+
+
+def test_cli_main_unexpected_exception(tmp_path, monkeypatch, capsys):
+    """Verify CLI main gracefully catches unexpected exceptions and returns code 1."""
+    real_script = tmp_path / "valid.sh"
+    real_script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    mock_rm = mock.Mock(side_effect=RuntimeError("Unexpected matrix crash"))
+    monkeypatch.setattr("opsscript_gate.cli.run_matrix", mock_rm)
+
+    exit_code = main(["run", str(real_script)])
+    assert exit_code == 1
+    mock_rm.assert_called_once()
+    captured = capsys.readouterr()
+    assert "Unexpected Error" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_cli_parser_defaults():
+    """Assert all CLI options have the expected default values in build_parser."""
+    parser = build_parser()
+    args = parser.parse_args(["run", "test.sh"])
+    assert args.command == "run"
+    assert args.script_path == "test.sh"
+    assert args.timeout == 60
+    assert args.jobs is None
+    assert args.shell == "posix"
+    assert args.mem_limit == "256m"
+    assert args.pids_limit == 128
+    assert args.network == "bridge"
+
+
+def test_collect_container_logs_single_giant_chunk():
+    """Verify a single chunk larger than max_bytes is sliced before extending the buffer."""
+    giant_chunk = ("A" * (MAX_CAPTURED_LOG_BYTES + 10000)) + "TAIL_DATA"
+
+    class MockGiantChunkContainer:
+        def logs(self, stdout=True, stderr=True, tail=None, stream=False):
+            assert stream is True
+            yield giant_chunk
+
+    container = MockGiantChunkContainer()
+    result = collect_container_logs(container, max_bytes=MAX_CAPTURED_LOG_BYTES)
+
+    assert len(result.encode("utf-8")) == MAX_CAPTURED_LOG_BYTES
+    assert result.endswith("TAIL_DATA")
+    assert result == giant_chunk[-MAX_CAPTURED_LOG_BYTES:]
+
+
+def test_reporter_copyable_markdown_fence_injection():
+    """Verify Copyable Markdown handles payloads attempting to break out of code fence or details."""
+    evil_payload = "FAKE PASS\n</details> ```\n```markdown\nInjected markdown"
+    res = SingleResult(
+        distro="alpine:3.20",
+        status=DistroStatus.FAIL,
+        exit_code=1,
+        duration=0.2,
+        error_message=evil_payload,
+    )
+    report = RunReport(results=[res], total_duration=0.2)
+    summary_md = format_markdown_compatibility_card(report, "test.sh")
+
+    # Must NOT contain an unescaped </details> inside the copyable block that closes the outer details
+    assert "<\\/details>" in summary_md
+    # All raw </details> occurrences in the summary must be legitimate HTML container closures (exactly 2)
+    raw_details_close = [m.start() for m in re.finditer(r"(?<!\\)</details>", summary_md)]
+    assert len(raw_details_close) == 2, f"Unescaped closing tag found in summary: {summary_md}"
+    # Code fence should dynamically scale to at least 4 backticks
+    assert "````markdown" in summary_md or "`````markdown" in summary_md
+
+
+def test_reporter_distro_cell_escaping():
+    """Verify distro names containing pipe characters do not split GFM table cells."""
+    distro_with_pipe = "ubuntu:24.04|FAKE"
+    res = SingleResult(
+        distro=distro_with_pipe,
+        status=DistroStatus.PASS,
+        exit_code=0,
+        duration=0.3,
+    )
+    report = RunReport(results=[res], total_duration=0.3)
+    card = format_markdown_compatibility_card(report, "test.sh")
+
+    # Find all rows matching the distro name
+    matching_rows = [line for line in card.splitlines() if "ubuntu:24.04" in line]
+    assert len(matching_rows) == 2, f"Expected 2 matching rows (matrix and copyable), got: {matching_rows}"
+
+    # Row 1: compatibility matrix table row (5 columns -> 6 delimiters)
+    matrix_row = matching_rows[0]
+    matrix_delims = [ch for i, ch in enumerate(matrix_row) if ch == "|" and (i == 0 or matrix_row[i-1] != "\\")]
+    assert len(matrix_delims) == 6, f"Matrix table row was split by unescaped pipe: {matrix_row}"
+    assert "`ubuntu:24.04\\|FAKE`" in matrix_row
+
+    # Row 2: copyable markdown matrix row (4 columns -> 5 delimiters)
+    copy_row = matching_rows[1]
+    copy_delims = [ch for i, ch in enumerate(copy_row) if ch == "|" and (i == 0 or copy_row[i-1] != "\\")]
+    assert len(copy_delims) == 5, f"Copyable table row was split by unescaped pipe: {copy_row}"
+    assert "`ubuntu:24.04\\|FAKE`" in copy_row
+
+
+def test_run_matrix_prepare_script_failure_semantics(tmp_path):
+    """Verify prepare_script failure surfaces ERROR for all distros and does not run Docker."""
+    script_path = tmp_path / "protected.sh"
+    script_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+
+    mock_docker_client = mock.MagicMock()
+
+    with mock.patch("opsscript_gate.runner.prepare_script", side_effect=PermissionError("Cannot read script")):
+        report = run_matrix(
+            script_path=str(script_path),
+            matrix=["debian:12-slim", "alpine:3.20"],
+            client=mock_docker_client,
+        )
+
+    # Assert no Docker containers created
+    mock_docker_client.containers.create.assert_not_called()
+    assert report.all_passed is False
+    assert len(report.results) == 2
+    for r in report.results:
+        assert r.status == DistroStatus.ERROR
+        assert "Failed to read/prepare script: Cannot read script" in (r.error_message or "")
+
+    # Verify CLI returns 1 on this failure
+    with mock.patch("opsscript_gate.runner.prepare_script", side_effect=PermissionError("Cannot read script")):
+        exit_code = main(["run", str(script_path)])
+        assert exit_code == 1
