@@ -3,11 +3,39 @@ import json
 import os
 import re
 import sys
+import unicodedata
+from opsscript_gate import __version__
 from opsscript_gate.models import DistroStatus, MultiScriptReport, RunReport, SingleResult
 
 # Structure-altering Markdown characters in regular prose:
 # \ ` * _ [ ] ( ) # + - ! > ~ |
 _MARKDOWN_SPECIAL_RE = re.compile(r"([\\`*_{}\[\]()#+\-.!>~|])")
+
+
+def sanitize_display_text(text: str) -> str:
+    """Remove terminal and Unicode format controls from untrusted display text."""
+    if not text:
+        return ""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return "".join(
+        ch
+        for ch in text
+        if not (ord(ch) < 32 or 0x7F <= ord(ch) <= 0x9F or unicodedata.category(ch) == "Cf")
+        or ch in "\t\n"
+    )
+
+
+def sanitize_workflow_text(text: str) -> str:
+    """Remove spoofing controls while retaining CR/LF for workflow escaping."""
+    return "".join(
+        ch
+        for ch in text
+        if not (
+            (ord(ch) < 32 and ch not in "\r\n\t")
+            or 0x7F <= ord(ch) <= 0x9F
+            or unicodedata.category(ch) == "Cf"
+        )
+    )
 
 
 def escape_inline_code(text: str) -> str:
@@ -17,7 +45,7 @@ def escape_inline_code(text: str) -> str:
     """
     if not text:
         return ""
-    cleaned = text.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+    cleaned = sanitize_display_text(text).replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
     return cleaned.replace("`", "'")
 
 
@@ -29,6 +57,7 @@ def escape_markdown_text(text: str) -> str:
     """
     if not text:
         return ""
+    text = sanitize_display_text(text)
     # Neutralize HTML tags and entities
     text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     # Escape brackets, parentheses, pipes, backticks, and backslashes to prevent links/code spans
@@ -54,7 +83,7 @@ def escape_markdown_table_cell(text: str) -> str:
     """
     if not text:
         return ""
-    cleaned = text.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+    cleaned = sanitize_display_text(text).replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
     # Neutralize details/summary tags that could break surrounding HTML layout
     cleaned = (
         cleaned.replace("</details>", "<\\/details>")
@@ -62,7 +91,16 @@ def escape_markdown_table_cell(text: str) -> str:
         .replace("</summary>", "<\\/summary>")
         .replace("<summary>", "<\\summary>")
     )
-    return cleaned.replace("|", "\\|")
+    escaped = html.escape(cleaned, quote=False)
+    escaped = escaped.replace("\\", "\\\\").replace("|", "\\|")
+    for special in ("`", "*", "_", "{", "}", "[", "]", "(", ")", "#", "+", "!", ">", "~"):
+        escaped = escaped.replace(special, f"\\{special}")
+    return escaped
+
+
+def _table_code_span(text: str) -> str:
+    """Keep code-span characters literal while protecting table delimiters."""
+    return "`" + escape_inline_code(text).replace("|", "\\|") + "`"
 
 
 def escape_html_text(text: str) -> str:
@@ -71,7 +109,7 @@ def escape_html_text(text: str) -> str:
     """
     if not text:
         return ""
-    return html.escape(text, quote=True)
+    return html.escape(sanitize_display_text(text), quote=True)
 
 
 def format_safe_code_fence(content: str, language: str = "text") -> list[str]:
@@ -85,7 +123,7 @@ def format_safe_code_fence(content: str, language: str = "text") -> list[str]:
 
     # Neutralize closing tags if present inside snippet so HTML details/summary container isn't closed
     safe_content = (
-        content.replace("</details>", "<\\/details>")
+        sanitize_display_text(content).replace("</details>", "<\\/details>")
         .replace("</summary>", "<\\/summary>")
         .replace("<details>", "<\\details>")
         .replace("<summary>", "<\\summary>")
@@ -111,6 +149,7 @@ def escape_github_property(value: str) -> str:
     Escape property values for GitHub Actions workflow commands.
     Escapes %, \\r, \\n, :, and ,
     """
+    value = sanitize_workflow_text(value)
     return (
         value.replace("%", "%25")
         .replace("\r", "%0D")
@@ -125,6 +164,7 @@ def escape_github_data(value: str) -> str:
     Escape message body content for GitHub Actions workflow commands.
     Escapes %, \\r, and \\n
     """
+    value = sanitize_workflow_text(value)
     return (
         value.replace("%", "%25")
         .replace("\r", "%0D")
@@ -140,14 +180,19 @@ def format_github_annotations(report: RunReport, script_path: str = "") -> list[
     """
     annotations: list[str] = []
     if script_path:
-        clean_path = script_path.replace("\\", "/")
-        if clean_path.startswith("./"):
-            clean_path = clean_path[2:]
-        try:
-            if os.path.isabs(clean_path):
-                clean_path = os.path.relpath(clean_path, ".").replace("\\", "/")
-        except Exception:
-            pass
+        clean_path = sanitize_display_text(script_path).replace("\\", "/")
+        if os.path.isabs(clean_path) or re.match(r"^[A-Za-z]:/", clean_path):
+            try:
+                clean_path = os.path.relpath(clean_path, os.getcwd()).replace("\\", "/")
+            except Exception:
+                clean_path = os.path.basename(clean_path)
+        norm = os.path.normpath(clean_path).replace("\\", "/")
+        while norm.startswith("./"):
+            norm = norm[2:]
+        if norm == ".." or norm.startswith("../") or "/../" in f"/{norm}/":
+            clean_path = os.path.basename(clean_path)
+        else:
+            clean_path = norm
         norm_script = clean_path if clean_path else "script.sh"
     else:
         norm_script = "script.sh"
@@ -157,17 +202,18 @@ def format_github_annotations(report: RunReport, script_path: str = "") -> list[
         if r.status == DistroStatus.PASS:
             continue
 
-        raw_title = f"OpsScript Gate: [{r.distro}] {r.status.value}"
+        safe_distro = sanitize_display_text(r.distro)
+        raw_title = f"OpsScript Gate: [{safe_distro}] {r.status.value}"
         if r.diagnostic and r.diagnostic.message:
-            raw_title = f"OpsScript Gate: [{r.distro}] {r.diagnostic.message}"
+            raw_title = f"OpsScript Gate: [{safe_distro}] {sanitize_display_text(r.diagnostic.message)}"
 
         msg_parts: list[str] = []
         if r.diagnostic:
-            msg_parts.append(r.diagnostic.message)
+            msg_parts.append(sanitize_display_text(r.diagnostic.message))
             if r.diagnostic.hint:
-                msg_parts.append(r.diagnostic.hint)
+                msg_parts.append(sanitize_display_text(r.diagnostic.hint))
         elif r.error_message:
-            msg_parts.append(r.error_message)
+            msg_parts.append(sanitize_display_text(r.error_message))
         else:
             msg_parts.append(f"Execution failed with exit code {r.exit_code}")
 
@@ -204,23 +250,28 @@ def format_terminal_table(report: RunReport, script_path: str = "") -> str:
     hints: list[tuple[str, str]] = []
 
     for r in report.results:
+        safe_distro = sanitize_display_text(r.distro)
         exit_code_str = str(r.exit_code) if r.exit_code is not None else "-"
         duration_str = f"{r.duration:.2f}s"
 
         if r.status == DistroStatus.PASS:
             detail = "OK"
+            if r.attempts > 1:
+                detail = f"OK ({r.passed_attempts}/{r.attempts} attempts)"
+        elif r.status == DistroStatus.FLAKY:
+            detail = sanitize_display_text(r.error_message or "Runtime was non-deterministic")
         elif r.diagnostic:
             line_suffix = f" (line {r.diagnostic.line})" if r.diagnostic.line else ""
-            detail = f"{r.diagnostic.message}{line_suffix}"
+            detail = f"{sanitize_display_text(r.diagnostic.message)}{line_suffix}"
             if r.diagnostic.hint:
-                hints.append((r.distro, r.diagnostic.hint))
+                hints.append((safe_distro, sanitize_display_text(r.diagnostic.hint)))
         elif r.error_message:
-            detail = r.error_message
+            detail = sanitize_display_text(r.error_message)
         else:
             detail = "-"
 
         rows.append([
-            r.distro,
+            safe_distro,
             r.status.value,
             exit_code_str,
             duration_str,
@@ -253,7 +304,7 @@ def format_terminal_table(report: RunReport, script_path: str = "") -> str:
 
     lines: list[str] = []
     if script_path:
-        lines.append(f"Target: {script_path}")
+        lines.append(f"Target: {sanitize_display_text(script_path)}")
 
     lines.extend([
         sep_line,
@@ -282,8 +333,9 @@ def format_terminal_table(report: RunReport, script_path: str = "") -> str:
         lines.append("Failed Distributions - Output Snippets (last 15 lines):")
         lines.append("=" * 60)
         for r in failed_results:
-            lines.append(f"\n--- [{r.distro}] ({r.status.value}) ---")
-            lines.append(r.output_snippet)
+            safe_distro = sanitize_display_text(r.distro)
+            lines.append(f"\n--- [{safe_distro}] ({r.status.value}) ---")
+            lines.append(sanitize_display_text(r.output_snippet))
 
     return "\n".join(lines)
 
@@ -331,6 +383,8 @@ def format_markdown_compatibility_card(report: RunReport, script_path: str = "")
     for r in report.results:
         if r.status == DistroStatus.PASS:
             status_icon = "✅ PASS"
+        elif r.status == DistroStatus.FLAKY:
+            status_icon = "⚠️ FLAKY"
         elif r.status == DistroStatus.FAIL:
             status_icon = "❌ FAIL"
         elif r.status == DistroStatus.TIMED_OUT:
@@ -338,26 +392,26 @@ def format_markdown_compatibility_card(report: RunReport, script_path: str = "")
         else:
             status_icon = "⚠️ ERROR"
 
-        distro_cell = escape_markdown_table_cell(f"`{escape_inline_code(r.distro)}`")
+        distro_cell = _table_code_span(r.distro)
         exit_code_str = f"`{r.exit_code}`" if r.exit_code is not None else "`N/A`"
         duration_str = f"`{r.duration:.2f}s`"
 
         if r.status == DistroStatus.PASS:
-            raw_diag = "OK"
+            diag_cell = "OK"
+        elif r.status == DistroStatus.FLAKY:
+            diag_cell = escape_markdown_table_cell(r.error_message or "Runtime was non-deterministic")
         elif r.diagnostic:
             line_str = f" (line {r.diagnostic.line})" if r.diagnostic.line else ""
-            clean_cmd = f"`{escape_inline_code(r.diagnostic.command)}`" if r.diagnostic.command else "command"
-            raw_diag = f"⚠️ Missing command: {clean_cmd}{line_str}"
+            clean_cmd = _table_code_span(r.diagnostic.command) if r.diagnostic.command else "command"
+            diag_cell = f"⚠️ Missing command: {clean_cmd}{line_str}"
             if r.diagnostic.hint:
-                raw_diag += f"<br>💡 *{r.diagnostic.hint}*"
+                diag_cell += f"<br>💡 *{escape_markdown_table_cell(r.diagnostic.hint)}*"
         elif r.error_message:
-            raw_diag = r.error_message
+            diag_cell = escape_markdown_table_cell(r.error_message)
         elif r.status != DistroStatus.PASS:
-            raw_diag = f"Non-zero exit code: {r.exit_code}"
+            diag_cell = f"Non-zero exit code: {r.exit_code}"
         else:
-            raw_diag = "-"
-
-        diag_cell = escape_markdown_table_cell(raw_diag)
+            diag_cell = "-"
         lines.append(
             f"| {distro_cell} | {status_icon} | {exit_code_str} | {duration_str} | {diag_cell} |"
         )
@@ -375,22 +429,22 @@ def format_markdown_compatibility_card(report: RunReport, script_path: str = "")
         "| :--- | :---: | :---: | :--- |",
     ]
     for r in report.results:
-        icon = "✅" if r.status == DistroStatus.PASS else "❌"
-        distro_cell = escape_markdown_table_cell(f"`{escape_inline_code(r.distro)}`")
+        icon = "✅" if r.status == DistroStatus.PASS else ("⚠️" if r.status == DistroStatus.FLAKY else "❌")
+        distro_cell = _table_code_span(r.distro)
         if r.status == DistroStatus.PASS:
-            raw_detail = "OK"
+            detail_cell = "OK"
+        elif r.status == DistroStatus.FLAKY:
+            detail_cell = escape_markdown_table_cell(r.error_message or "Runtime was non-deterministic")
         elif r.diagnostic:
-            safe_cmd = escape_inline_code(r.diagnostic.command or "")
-            raw_detail = f"Missing `{safe_cmd}`"
+            detail_cell = f"Missing {_table_code_span(r.diagnostic.command or '')}"
             if r.diagnostic.line:
-                raw_detail += f" (L{r.diagnostic.line})"
+                detail_cell += f" (L{r.diagnostic.line})"
             if r.diagnostic.hint:
-                raw_detail += f" — *{r.diagnostic.hint}*"
+                detail_cell += f" — *{escape_markdown_table_cell(r.diagnostic.hint)}*"
         elif r.error_message:
-            raw_detail = r.error_message
+            detail_cell = escape_markdown_table_cell(r.error_message)
         else:
-            raw_detail = "-"
-        detail_cell = escape_markdown_table_cell(raw_detail)
+            detail_cell = "-"
         copy_lines.append(f"| {distro_cell} | {icon} {r.status.value} | `{r.duration:.2f}s` | {detail_cell} |")
 
     copy_content = "\n".join(copy_lines)
@@ -461,6 +515,143 @@ def format_multi_github_summary(multi_report: MultiScriptReport) -> str:
 def format_json(report: RunReport | MultiScriptReport) -> str:
     """Format the report as structured JSON."""
     return json.dumps(report.to_dict(), indent=2, ensure_ascii=False)
+
+
+_SARIF_SCHEMA = "https://json.schemastore.org/sarif-2.1.0.json"
+_SARIF_RULES = {
+    DistroStatus.FAIL: ("OSG001", "Runtime compatibility failure"),
+    DistroStatus.TIMED_OUT: ("OSG002", "Runtime compatibility check timed out"),
+    DistroStatus.ERROR: ("OSG003", "Runtime compatibility check error"),
+    DistroStatus.FLAKY: ("OSG004", "Runtime compatibility check was flaky"),
+}
+
+
+def _sarif_path(script_path: str) -> str:
+    """Return a repository-relative SARIF artifact path."""
+    clean = sanitize_display_text(script_path or "script.sh").replace("\\", "/")
+    # SARIF locations are interpreted relative to the checked-out repository.
+    # Convert absolute local/CI paths before serializing and avoid emitting a
+    # path that escapes the repository when the target lives elsewhere.
+    if os.path.isabs(clean) or re.match(r"^[A-Za-z]:/", clean):
+        try:
+            clean = os.path.relpath(clean, os.getcwd()).replace("\\", "/")
+        except ValueError:
+            clean = os.path.basename(clean)
+    while clean.startswith("./"):
+        clean = clean[2:]
+    norm = os.path.normpath(clean).replace("\\", "/")
+    while norm.startswith("./"):
+        norm = norm[2:]
+    if norm == ".." or norm.startswith("../") or "/../" in f"/{norm}/":
+        clean = os.path.basename(clean)
+    else:
+        clean = norm
+    return clean or "script.sh"
+
+
+def _sarif_message(result: SingleResult) -> str:
+    parts = [f"[{sanitize_display_text(result.distro)}] {result.status.value}"]
+    if result.diagnostic:
+        parts.append(sanitize_display_text(result.diagnostic.message))
+        if result.diagnostic.hint:
+            parts.append(sanitize_display_text(result.diagnostic.hint))
+    elif result.error_message:
+        parts.append(sanitize_display_text(result.error_message))
+    elif result.exit_code is not None:
+        parts.append(f"Execution exited with code {result.exit_code}.")
+    return " — ".join(parts)
+
+
+def _sarif_result(result: SingleResult, script_path: str) -> dict[str, object] | None:
+    if result.status == DistroStatus.PASS:
+        return None
+
+    rule_id, rule_name = _SARIF_RULES[result.status]
+    physical_location: dict[str, object] = {
+        "artifactLocation": {
+            "uri": _sarif_path(script_path),
+        },
+    }
+    if result.diagnostic and result.diagnostic.line and result.diagnostic.line > 0:
+        physical_location["region"] = {"startLine": result.diagnostic.line}
+
+    properties: dict[str, object] = {
+        "distribution": sanitize_display_text(result.distro),
+        "status": result.status.value,
+        "durationSeconds": round(result.duration, 3),
+    }
+    if result.exit_code is not None:
+        properties["exitCode"] = result.exit_code
+    if result.diagnostic:
+        if result.diagnostic.command:
+            properties["command"] = sanitize_display_text(result.diagnostic.command)
+        if result.diagnostic.suggested_package:
+            properties["suggestedPackage"] = sanitize_display_text(result.diagnostic.suggested_package)
+
+    return {
+        "ruleId": rule_id,
+        "level": "error",
+        "message": {"text": _sarif_message(result)},
+        "locations": [{"physicalLocation": physical_location}],
+        "properties": properties,
+    }
+
+
+def _sarif_run(results: list[dict[str, object]]) -> dict[str, object]:
+    return {
+        "tool": {
+            "driver": {
+                "name": "OpsScript Gate",
+                "version": __version__,
+                "informationUri": "https://github.com/Mresyzz/opsscript-gate",
+                "rules": [
+                    {
+                        "id": rule_id,
+                        "name": rule_name,
+                        "shortDescription": {"text": rule_name},
+                        "help": {
+                            "text": rule_name,
+                        },
+                        "helpUri": "https://github.com/Mresyzz/opsscript-gate#ci-output",
+                    }
+                    for rule_id, rule_name in _SARIF_RULES.values()
+                ],
+            },
+        },
+        "results": results,
+    }
+
+
+def format_sarif(report: RunReport, script_path: str = "") -> str:
+    """Format runtime failures as SARIF 2.1.0 for GitHub Code Scanning."""
+    results = [
+        item
+        for result in report.results
+        if (item := _sarif_result(result, script_path)) is not None
+    ]
+    payload = {
+        "$schema": _SARIF_SCHEMA,
+        "version": "2.1.0",
+        "runs": [_sarif_run(results)],
+    }
+    return json.dumps(payload, indent=2, ensure_ascii=False)
+
+
+def format_multi_sarif(report: MultiScriptReport) -> str:
+    """Format multi-script runtime failures as one SARIF 2.1.0 run."""
+    results: list[dict[str, object]] = []
+    for script_path, script_report in report.reports.items():
+        results.extend(
+            item
+            for result in script_report.results
+            if (item := _sarif_result(result, script_path)) is not None
+        )
+    payload = {
+        "$schema": _SARIF_SCHEMA,
+        "version": "2.1.0",
+        "runs": [_sarif_run(results)],
+    }
+    return json.dumps(payload, indent=2, ensure_ascii=False)
 
 
 def write_github_step_summary(

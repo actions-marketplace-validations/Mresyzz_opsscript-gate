@@ -1,21 +1,144 @@
 # Changelog
 
+## [0.9.4] - 2026-10-11
+
+### Fixed
+- Fixed release workflow publishing deadlock where `main` pushes skipped distribution package builds and release creation due to GITHUB_TOKEN tag events not triggering new workflows.
+- Unified command path extraction in remediation rules to ensure full-path commands (e.g. `/usr/bin/apt-get`, `/sbin/apk`, `/bin/yum`, `/usr/local/bin/bash`) accurately match package manager and shell hints.
+- Added native RHEL/Fedora/CentOS package mappings in `COMMON_COMMAND_PACKAGES` to prevent fallback to invalid Debian package names.
+- Added native container package pre-installation support for `dnf`, `microdnf`, and `yum` in `runner._wrap_with_package_setup`.
+- Fixed `RunReport` and `MultiScriptReport` `__post_init__` to preserve explicitly passed `all_passed=False` when result collections are empty.
+- Supported bare directory exclusions (e.g. `tests` or `tests/`) in `_matches_exclude` to match both directories and all contained files.
+
+## [0.9.3] - 2026-10-11
+
+### Added
+- Added cross-distribution package name mapping and actionable remediation suggestions (`apt-get`, `apk`, `dnf`) for common missing operations commands (`curl`, `wget`, `jq`, `git`, `tar`, `python3`, `pip`, `sudo`, `make`, `gcc`, etc.).
+- Extended `FailureDiagnostic` and SARIF output with structured `suggested_package` property.
+
+### Fixed
+- Fixed unreadable shell script candidate misclassification during discovery.
+- Ensured temporary script files are safely cleaned up during distribution preparation errors.
+- Added preflight validation to reject directory and missing script paths before creating worker threads.
+- Enforced consistent POSIX LF line endings in report output files across platforms.
+
+## [0.9.2] - 2026-10-05
+
+### Fixed
+- Hardened SARIF, Markdown, terminal, and machine-readable output handling.
+- Prevented false package-setup errors, stale Docker wait results, hard-link overwrites, and unbounded log copies.
+- Added BOM-aware discovery, Windows exclusion normalization, bounded concurrency, and runtime option validation.
+- Added a one-CPU container limit and bounded Docker log rotation, while keeping disposable container filesystems writable for installers.
+- Normalized SARIF paths, preserved actionable repeat-run diagnostics, skipped hidden auto-discovered files, and kept terminal reports visible when file output fails.
+- Fixed release workflow tag handoff so a `main` push cannot publish the same version twice.
+- Made `doctor` reject Docker's Windows-container mode before Linux image checks begin.
+- Added problem-first FAQ content, structured data, canonical URLs, and AI-readable answers for runtime compatibility searches.
+- Bounded repeat runs to 20 attempts per distribution to prevent accidental unbounded container work and result retention.
+- Bounded per-container timeouts to one hour so fallback polling cannot wait indefinitely on an extreme configuration.
+- Bounded custom matrices to 32 images so a single configuration cannot create unbounded container work.
+- Fixed `_is_ignored_path` in script discovery to avoid misclassifying paths with leading `./` as ignored.
+- Traversed exception cause chains in `_is_wait_timeout_error` to reliably identify nested Docker wait timeouts.
+- Protected container reload against network jitter to preserve valid exit codes.
+- Added early validation for CLI `--output` to reject existing directories before executing test matrices.
+- Expanded cross-distro package manager diagnostics and added remediation for path-qualified curl/wget and missing sudo.
+- Refreshed active workflow templates, examples, and documentation to `v0.9.2`.
+
+## [0.9.1] - 2026-10-03
+
+### Fixed
+- Normalized discovery exclusions so top-level paths match with or without `./`.
+- Made SARIF output conform to the 2.1.0 result schema.
+- Failed closed when Docker omitted an exit code and separated package setup errors from script failures.
+- Validated project configuration in `doctor` and handled UTF-8 BOM scripts.
+- Distinguished Docker wait API errors from genuine execution timeouts.
+
+## [0.9.0] - 2026-10-03
+
+### Added
+- Added `--repeat` and Action/config `repeat` support to detect flaky runtime behavior per distribution.
+- Added attempt counts and `FLAKY` status to JSON, Markdown, SARIF, terminal, and GitHub Step Summary reports.
+
+### Fixed
+- Bounded project configuration reads to prevent oversized configuration files from consuming unbounded memory.
+- Prefer Docker's blocking wait API over repeated synchronous container reloads, while retaining a bounded compatibility fallback.
+- Removed duplicated CLI execution error handling and the unused `asdict` import.
+
+## [0.8.3] - 2026-10-02
+
+- Corrected the PyPI homepage and demo links to point to the OpsScript Gate Pages site.
+- Refreshed all generated examples and release metadata to v0.8.3.
+
+## [0.8.2] - 2026-10-02
+
+### Fixed
+- Disabled both APT post-invoke hook variants used by current base images during ephemeral package setup.
+
+## [0.8.1] - 2026-10-02
+
+### Fixed
+- Prevented Debian and Ubuntu image cleanup hooks from turning optional package setup into a false compatibility failure.
+- Kept package installation and target script failures fail-closed while making ephemeral cache cleanup best-effort.
+
+## [0.8.0] - 2026-10-02
+
+### Added
+- Added opt-in `packages` setup for installing validated package names with
+  `apt-get` or `apk` before each container run; package setup requires bridge
+  networking and leaves existing offline runs unchanged.
+
+## [0.7.0] - 2026-10-01
+
+### Added
+- Added `opsscript-gate doctor` to diagnose Python and Docker prerequisites before a local run.
+- Added SARIF 2.1.0 output for location-aware GitHub Code Scanning integration.
+
+### Changed
+- Expanded package and Marketplace keywords for shell installers, ShellCheck users, portability, and BusyBox.
+- Clarified the Action description around shell installer runtime compatibility.
+
+## [0.6.2] - 2026-10-01
+
+### Changed
+- Updated the published README and Action examples to the current release tag.
+- Added the InstallReady browser scanner to the package homepage and project links.
+- Made the starter workflow follow each repository's default branch.
+
+## [0.6.1] - 2026-10-01
+
+### Added
+- Added a zero-configuration GitHub workflow starter that runs only when shell files change.
+- Added a copyable compatibility report artifact to the starter workflow.
+- Added citation metadata and clearer PyPI keywords for installer and bootstrap use cases.
+
+### Changed
+- Marked the project Beta now that the default matrix, safety controls, reports, presets, and changed-script mode are released.
+- Updated the roadmap to show the v0.5 and v0.6 controls as delivered.
+
+## [0.6.0] - 2026-09-30
+
+### Added
+- Added `--changed-since` and the matching Action input to test only shell scripts changed since a Git revision.
+- Changed-script selection uses the existing discovery safety checks and passes when a change contains no shell scripts.
+
+## [0.5.1] - 2026-09-30
+
+### Changed
+- Published the current README and examples with the v0.5.1 Action tag.
+- Updated package and Action metadata to describe the supported container matrix and runtime compatibility check.
+
 ## [0.5.0] - 2026-09-24
 
 ### Added
-- `init`: non-overwriting project configuration and GitHub workflow generation.
-- Shared, strictly validated `.opsscript-gate.json` settings; explicit CLI/Action inputs win.
-- Docker-free `--dry-run` plans in text or JSON, including execution counts.
-- `minimal` and `ubuntu` distribution presets, repeatable exclusion globs and configurable discovery limit.
-- `--output` report artifacts, including failure reports; source/config overwrite protection.
-- Action inputs for configuration, presets, exclusions, preview and saved reports.
-- Chinese quickstart, configuration guide and Ubuntu/Alpine troubleshooting guide.
+- Added `opsscript-gate init` to create a config file and GitHub workflow without replacing existing files.
+- Added `.opsscript-gate.json` with CLI and Action overrides.
+- Added `--dry-run`, `minimal` and `ubuntu` presets, exclusion globs, and `--output` reports.
+- Added configuration, Chinese quickstart, and Ubuntu/Alpine troubleshooting documentation.
 
 ### Fixed
-- Discovery now fails on overflow instead of silently testing only the first 20 scripts.
-- Discovery skips symlinks and non-files and rejects shebang prefix collisions.
-- CLI rejects non-positive limits and unsupported network modes before execution.
-- Default Action inputs no longer override a user's project configuration.
+- Discovery stops at the first candidate beyond the configured limit instead of silently ignoring files.
+- Discovery skips symlinks and non-files and checks shebangs without prefix matches.
+- CLI validates limits and network modes before execution.
+- Empty Action inputs no longer override project configuration.
 
 ### Migration
 - Repositories with more than 20 discovered scripts must exclude unwanted scripts or raise `max_scripts`.
@@ -31,8 +154,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.4.1] - 2026-09-19
 
 ### Fixed & Hardened
-- **Bounded container log capture**: Stream-captures container logs using an immediate rolling byte buffer capped at 256 KiB (`MAX_CAPTURED_LOG_BYTES`) and tail limited to 500 lines (`MAX_LOG_TAIL_LINES`), bounding retained container log data to reduce memory-exhaustion risk from runaway output.
-- **Workflow command neutralization**: Neutralizes untrusted container logs starting with `::` into `[container] ::` to prevent malicious scripts from forging GitHub Actions workflow commands in Runner consoles, while keeping OpsScript Gate's own annotations intact.
+- Bounded container log capture with a 256 KiB rolling buffer and 500-line tail.
+- Neutralized untrusted container logs beginning with `::` before they reach GitHub Actions.
 - **Terminal ANSI and control character sanitization**: Strips ANSI escape sequences (CSI, OSC, 2-byte escapes), removes dangerous C0 control characters and DEL, and normalizes CRLF and standalone carriage returns (`\r`) to defeat terminal line overwrite and status spoofing, while preserving printable Unicode.
 - **Context-sensitive Markdown and HTML injection defense**: Implemented dedicated escaping (`escape_inline_code`, `escape_markdown_text`, `escape_markdown_table_cell`, `escape_html_text`, `format_safe_code_fence`) to prevent table cell tearing, HTML container breakout (`</details>`), premature code fence closure, and structural Markdown injection from runtime-derived values.
 - **Bounded streaming script preparation**: Stream-normalizes CRLF in bounded 64 KiB chunks (`SCRIPT_READ_CHUNK_SIZE`), properly handling boundary-split CRLF while preserving lone CR bytes without whole-file memory allocation. Bounded shebang parsing to 4096 bytes (`MAX_SHEBANG_BYTES`).
@@ -45,15 +168,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.4.0] - 2026-09-19
 
 ### Added
-- **High-confidence line-level GitHub Actions annotations**: Emits inline `::error` annotations with exact script line numbers directly on pull request file diffs.
+- Line-level GitHub Actions annotations with script paths and line numbers.
 - **Workflow command injection defense**: Strictly escapes parameters (`%`, `\r`, `\n`, `:`, `,`) and message bodies (`%`, `\r`, `\n`) to eliminate command injection from unclassified container logs.
-- **Conservative distro-aware remediation hints**: Suggests testable, high-confidence remediation recommendations (`RemediationRule`) with conservative phrasing (`normally`, `may`, `consider`), covering:
+- Distro-aware remediation hints for common mismatches, including:
   - Alpine package manager mismatches (`apt`/`apt-get` -> `apk`)
   - Debian/Ubuntu package manager mismatches (`apk` -> `apt-get`)
   - Alpine minimal missing Bash (`bash` -> consider POSIX sh or installing bash)
   - Missing network prerequisites (`curl`, `wget`)
   - Missing shebang interpreter paths.
-- **Re-engineered Compatibility Card**: Overhauled GitHub Actions Step Summary with an instant 5-second triage table and an expandable copy-pasteable Markdown snippet ready for PR descriptions and Issue comments.
+- Updated the GitHub Actions Step Summary with a compatibility table and a Markdown result block.
 - **Parallel matrix execution (`--jobs` / `jobs`)**: Concurrently runs container checks using `ThreadPoolExecutor` (defaults to `min(2, matrix_size)`), strictly preserving matrix output order and ensuring reliable container cleanup.
 - **Hardened container resource limits**: Added `--mem-limit` (default: 256m) and `--pids-limit` (default: 128) flags and Action inputs to prevent runaway resource exhaustion.
 - **Configurable network isolation (`--network`)**: Supports `--network bridge` (default) and `--network none` for offline script execution.
@@ -70,7 +193,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Structured runtime failure diagnostics: detect common "command not found" failures across Linux distributions (Alpine/BusyBox ash, Debian/Ubuntu dash, Bash, and missing interpreter paths).
-- High-confidence dual-signal classification: requires exit code 127 and matching shell output to produce a `missing_command` diagnostic.
+- Missing-command classification requires exit code 127 and matching shell output.
 - Additive `diagnostic` field in JSON report format (`SingleResult.to_dict()`) providing structured diagnostic information (backward-compatible for consumers tolerating additional fields).
 - Enhanced terminal table formatting and GitHub Actions Step Summary showing clear failure causes in the summary overview.
 
@@ -104,7 +227,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Configured PyPI Trusted Publishing via GitHub Actions OIDC (`pypa/gh-action-pypi-publish`).
 - Added full PyPI package metadata, classifiers, and project URLs to `pyproject.toml`.
-- Ensured absolute asset URLs in `README.md` for seamless PyPI rendering.
+- Ensured asset URLs in `README.md` render correctly on PyPI.
 
 ---
 

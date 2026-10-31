@@ -7,11 +7,15 @@ have these commands.
 
 ```bash
 opsscript-gate init
+opsscript-gate doctor
 opsscript-gate run --dry-run
 ```
 
 `init` refuses to overwrite either `.opsscript-gate.json` or
-`.github/workflows/opsscript-gate.yml`. The generated workflow uses the v0.5.0 tag.
+`.github/workflows/opsscript-gate.yml`. The generated workflow uses the v0.9.2 tag.
+
+`doctor` checks Python and Docker connectivity without executing repository scripts.
+Use `opsscript-gate doctor --format json` when collecting a support report.
 
 The generated config uses the two-image `minimal` preset, honors recognized shell
 shebangs, disables networking, and excludes `tests/*` and `examples/*`. Review these
@@ -30,7 +34,9 @@ directory, not the config file's parent.
   "preset": "minimal",
   "shell": "auto",
   "network": "none",
+  "packages": [],
   "timeout": 30,
+  "repeat": 1,
   "jobs": 2,
   "mem_limit": "256m",
   "pids_limit": 128,
@@ -42,7 +48,14 @@ directory, not the config file's parent.
 These are all supported keys, plus `matrix`, a comma-separated image string used
 instead of `preset`. Unknown keys and incorrect value types are errors. Numeric
 limits must be positive integers. `shell` accepts `posix`, `auto`, `shebang`;
-`network` accepts `none`, `bridge`.
+`network` accepts `none`, `bridge`. `packages` is an optional list of package
+names to install inside each test container before the target script runs. The
+runner uses `apt-get` for Debian/Ubuntu images and `apk` for Alpine images. It
+accepts package names only, never shell commands, and requires `network: bridge`.
+The default is an empty list, so existing networking settings and execution remain unchanged.
+`repeat` runs each distribution more than once (up to 20 attempts) and reports `FLAKY` when at least one
+attempt passes and another fails. Keep it at `1` for the normal fast gate; use `3` or
+`5` while investigating intermittent CI failures.
 
 | Preset | Images |
 | --- | --- |
@@ -77,6 +90,7 @@ opsscript-gate run scripts/install.sh --matrix alpine:3.20 --network bridge
 
 ```bash
 opsscript-gate run --format json --output reports/compatibility.json
+opsscript-gate run --repeat 3 --format markdown
 opsscript-gate run --dry-run --format json --output reports/plan.json
 ```
 
@@ -89,12 +103,31 @@ test result. Docker startup failures may occur before a report can be produced.
 The Action accepts matching `config`, `preset`, `max-scripts`, `dry-run`, and `output`
 inputs; `exclude` is a multiline list. Omitted execution inputs preserve config values.
 
+For pull requests, set `changed-since` to the base commit and fetch full Git history:
+
 ```yaml
-- uses: Mresyzz/opsscript-gate@v0.5.0
+- uses: actions/checkout@v7
+  with:
+    fetch-depth: 0
+- uses: Mresyzz/opsscript-gate@v0.9.2
+  with:
+    changed-since: ${{ github.event.pull_request.base.sha }}
+    preset: minimal
+```
+
+The Action passes when no changed shell scripts are selected. This keeps unrelated
+documentation or application changes from starting container jobs.
+
+```yaml
+- uses: Mresyzz/opsscript-gate@v0.9.2
   with:
     config: .opsscript-gate.json
     format: json
     output: reports/compatibility.json
+    network: bridge
+    packages: |
+      curl
+      ca-certificates
     exclude: |
       tests/*
       examples/*
@@ -113,3 +146,6 @@ offline networking and a smaller matrix. Existing users do not need to run `init
 
 The intentional breaking corrections are that discovery overflow now fails and
 symlinked files are no longer automatically selected. Preview discovery after upgrading.
+
+`timeout` is the hard limit per container in seconds. It must be between 1 and 3600.
+Custom `matrix` values may contain up to 32 container images.

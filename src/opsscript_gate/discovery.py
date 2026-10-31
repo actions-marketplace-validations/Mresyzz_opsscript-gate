@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import fnmatch
+import subprocess
 from pathlib import Path
 
 # Directories to ignore during automatic script discovery
@@ -39,11 +40,50 @@ MAX_DISCOVERED_SCRIPTS = 20
 MAX_SCRIPT_SIZE_BYTES = 1024 * 1024  # 1 MB
 
 
+def _matches_exclude(rel_path: str, patterns: list[str] | None) -> bool:
+    """Match exclusions consistently whether callers use ``foo.sh``, ``./foo.sh``, ``/foo.sh``, or directory names like ``tests``."""
+    normalized_path = rel_path.replace("\\", "/")
+    while normalized_path.startswith("./"):
+        normalized_path = normalized_path[2:]
+    normalized_path = normalized_path.lstrip("/")
+    for pattern in patterns or []:
+        normalized_pattern = pattern.replace("\\", "/")
+        while normalized_pattern.startswith("./"):
+            normalized_pattern = normalized_pattern[2:]
+        normalized_pattern = normalized_pattern.lstrip("/")
+        if not normalized_pattern:
+            continue
+        if fnmatch.fnmatchcase(normalized_path, normalized_pattern):
+            return True
+        pat = normalized_pattern.rstrip("/")
+        if normalized_path == pat or normalized_path.startswith(f"{pat}/") or fnmatch.fnmatchcase(normalized_path, f"{pat}/*"):
+            return True
+    return False
+
+
+def _is_ignored_path(rel_path: str) -> bool:
+    """Return whether a repository-relative path is outside automatic discovery."""
+    normalized = rel_path.replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    parts = normalized.split("/")
+    return any(
+        part in IGNORED_DIRS
+        or part == ".."
+        or part.endswith(".egg-info")
+        or (part.startswith(".") and part not in (".", ".."))
+        for part in parts
+        if part
+    )
+
+
+
 def is_shell_script(file_path: Path, max_size_bytes: int = MAX_SCRIPT_SIZE_BYTES) -> bool:
     """
     Check if a file is a candidate shell script:
     - Must be a regular file, never a symlink.
     - File size must not exceed max_size_bytes.
+    - Must be readable by the current process.
     - Extension is .sh or .bash, OR the first line is a recognized shell shebang.
     """
     try:
@@ -53,15 +93,14 @@ def is_shell_script(file_path: Path, max_size_bytes: int = MAX_SCRIPT_SIZE_BYTES
         if stat.st_size == 0 or stat.st_size > max_size_bytes:
             return False
 
+        with open(file_path, "rb") as f:
+            first_line_bytes = f.readline(256)
+
         ext = file_path.suffix.lower()
         if ext in (".sh", ".bash"):
             return True
 
-        # If extension is not .sh/.bash, inspect the first line
-        with open(file_path, "rb") as f:
-            first_line_bytes = f.readline(256)
-
-        first_line = first_line_bytes.decode("utf-8", errors="ignore").strip()
+        first_line = first_line_bytes.decode("utf-8-sig", errors="ignore").strip()
         return any(first_line == prefix or first_line.startswith(prefix + " ")
                    for prefix in SHELL_SHEBANG_PREFIXES)
     except (OSError, PermissionError):
@@ -96,11 +135,13 @@ def discover_scripts(
         current_path = Path(dirpath)
 
         for filename in filenames:
+            if filename.startswith("."):
+                continue
             file_path = current_path / filename
             if is_shell_script(file_path, max_size_bytes=max_size_bytes):
                 try:
                     rel_path = file_path.relative_to(root_path).as_posix()
-                    if any(fnmatch.fnmatchcase(rel_path, pattern) for pattern in (exclude or [])):
+                    if _matches_exclude(rel_path, exclude):
                         continue
                     # Prepend ./ if top-level for standard script path conventions
                     if not rel_path.startswith("./") and "/" not in rel_path:
@@ -117,3 +158,68 @@ def discover_scripts(
     # Sort alphabetically for stable, deterministic ordering
     discovered.sort()
     return discovered
+
+
+def discover_changed_scripts(
+    root_dir: str = ".",
+    since: str = "HEAD^",
+    max_scripts: int = MAX_DISCOVERED_SCRIPTS,
+    max_size_bytes: int = MAX_SCRIPT_SIZE_BYTES,
+    exclude: list[str] | None = None,
+) -> list[str]:
+    """Discover shell scripts changed between ``since`` and ``HEAD``.
+
+    Git provides the candidate paths; the same file, size, shebang, exclusion,
+    and overflow checks used by normal discovery still apply. A missing Git
+    repository or unavailable revision is reported as a user-facing error.
+    """
+    root_path = Path(root_dir).resolve()
+    if not since or not since.strip() or since.startswith("-") or any(char.isspace() for char in since):
+        raise ValueError("changed-since must name a Git revision")
+
+    try:
+        result = subprocess.run(
+            ["git", "diff", "--name-only", "--diff-filter=ACMR", "-z",
+             f"{since}...HEAD", "--"],
+            cwd=root_path,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError as exc:
+        raise ValueError("changed-since requires Git to be installed") from exc
+    except subprocess.CalledProcessError as exc:
+        detail = exc.stderr.decode("utf-8", errors="replace").strip()
+        raise ValueError(
+            f"Cannot compare Git revision {since!r} with HEAD"
+            + (f": {detail}" if detail else "")
+        ) from exc
+
+    changed_paths = [
+        item.decode("utf-8", errors="surrogateescape")
+        for item in result.stdout.split(b"\0")
+        if item
+    ]
+    discovered: list[str] = []
+    for relative_name in changed_paths:
+        candidate = root_path / Path(relative_name)
+        try:
+            resolved = candidate.resolve()
+            rel_path = resolved.relative_to(root_path).as_posix()
+        except (OSError, ValueError):
+            continue
+        if _is_ignored_path(rel_path):
+            continue
+        if _matches_exclude(rel_path, exclude):
+            continue
+        if not is_shell_script(candidate, max_size_bytes=max_size_bytes):
+            continue
+        normalized = rel_path if "/" in rel_path else f"./{rel_path}"
+        discovered.append(normalized)
+        if len(discovered) > max_scripts:
+            raise ValueError(
+                f"Changed files include more than {max_scripts} shell scripts, exceeding limit. "
+                "Use --exclude or increase --max-scripts; no scripts were executed."
+            )
+
+    return sorted(set(discovered))

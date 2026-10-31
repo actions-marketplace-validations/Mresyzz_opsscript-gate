@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import math
 import os
 import re
+import shlex
+import socket
 import tempfile
 import time
+import unicodedata
 from typing import Any, Sequence
 
 import docker
@@ -12,8 +16,9 @@ from docker.errors import DockerException, ImageNotFound
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from enum import Enum
+from opsscript_gate.config import MAX_MATRIX_IMAGES, MAX_REPEAT_ATTEMPTS, MAX_TIMEOUT_SECONDS, PACKAGE_NAME_RE, validate_memory_limit, validate_packages
 from opsscript_gate.models import DistroStatus, FailureDiagnostic, RunReport, ShellMode, SingleResult
-from opsscript_gate.remediation import generate_remediation_hint
+from opsscript_gate.remediation import generate_remediation_hint, resolve_package_recommendation
 
 DEFAULT_MATRIX: list[str] = [
     "debian:12-slim",
@@ -28,6 +33,8 @@ MAX_CAPTURED_LOG_BYTES: int = 256 * 1024  # 256 KiB
 MAX_LOG_TAIL_LINES: int = 500
 MAX_SHEBANG_BYTES: int = 4096
 SCRIPT_READ_CHUNK_SIZE: int = 64 * 1024  # 64 KiB
+MAX_CONCURRENT_JOBS: int = 32
+MAX_NANO_CPUS: int = 1_000_000_000  # One CPU; Docker nano_cpus uses 1e-9 CPU units.
 
 # Fixed trusted command mappings for supported shebang interpreter forms.
 # Any executed command is guaranteed to come strictly from this predefined constant map.
@@ -52,10 +59,30 @@ _ANSI_ESCAPE_RE = re.compile(
 
 # C0 control characters to strip from terminal logs: all ASCII < 32 except \t (9) and \n (10), plus DEL (127)
 _DANGEROUS_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_DANGEROUS_C1_RE = re.compile(r"[\x80-\x9f]")
 
 # Neutralize lines starting with "::" to prevent forged GitHub Actions workflow commands
 # e.g. "::error file=fake.sh::forged" -> "[container] ::error file=fake.sh::forged"
 _WORKFLOW_COMMAND_LINE_RE = re.compile(r"^(::)", re.MULTILINE)
+
+UTF8_BOM = b"\xef\xbb\xbf"
+PACKAGE_SETUP_ERROR_MARKER = "OPSSCRIPT_GATE_SETUP_ERROR:"
+
+
+def _is_wait_timeout_error(exc: Exception) -> bool:
+    """Return whether a Docker wait exception represents an actual timeout."""
+    curr: BaseException | None = exc
+    visited = set()
+    while curr is not None and id(curr) not in visited:
+        visited.add(id(curr))
+        if isinstance(curr, (TimeoutError, socket.timeout)):
+            return True
+        name = curr.__class__.__name__.lower()
+        if name in {"readtimeout", "readtimeouterror", "sockettimeout"}:
+            return True
+        curr = curr.__cause__ or curr.__context__
+    return False
+
 
 
 def sanitize_log_output(text: str) -> str:
@@ -75,6 +102,9 @@ def sanitize_log_output(text: str) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     # Strip dangerous C0 control characters and DEL
     text = _DANGEROUS_CONTROL_CHAR_RE.sub("", text)
+    # Strip C1 controls and Unicode format controls (including bidi overrides)
+    text = _DANGEROUS_C1_RE.sub("", text)
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
     # Neutralize line-leading '::' commands from untrusted container logs
     return _WORKFLOW_COMMAND_LINE_RE.sub(r"[container] \1", text)
 
@@ -92,7 +122,10 @@ def sanitize_diagnostic_text(text: str, max_length: int = 200) -> str:
     # Strip complete ANSI escape sequences first
     text = _ANSI_ESCAPE_RE.sub("", text)
     # Filter out control characters (ASCII < 32 and 127)
-    sanitized = "".join(ch if (32 <= ord(ch) < 127 or ord(ch) >= 160) else " " for ch in text)
+    sanitized = "".join(
+        ch if (32 <= ord(ch) < 127 or (ord(ch) >= 160 and unicodedata.category(ch) != "Cf")) else " "
+        for ch in text
+    )
     # Collapse multiple consecutive whitespace
     sanitized = " ".join(sanitized.split())
     if len(sanitized) > max_length:
@@ -199,13 +232,20 @@ def extract_failure_diagnostic(
             continue
 
         line_str = m.group("line1") or m.group("line2")
-        line_num = int(line_str) if (line_str and line_str.isdigit()) else None
+        # Avoid converting attacker-controlled arbitrarily long digit strings.
+        line_num = None
+        if line_str and len(line_str) <= 9 and line_str.isdigit():
+            try:
+                line_num = int(line_str)
+            except ValueError:
+                line_num = None
 
         hint = generate_remediation_hint(
             distro=distro,
             command=sanitized_cmd,
             kind="missing_command",
         )
+        suggested_pkg, _ = resolve_package_recommendation(sanitized_cmd, distro)
 
         return FailureDiagnostic(
             kind="missing_command",
@@ -214,6 +254,7 @@ def extract_failure_diagnostic(
             line=line_num,
             distro=distro,
             hint=hint,
+            suggested_package=suggested_pkg,
         )
 
     return None
@@ -255,6 +296,9 @@ def inspect_shebang(script_path: str) -> ShebangParseResult:
             status=ShebangStatus.MALFORMED,
             error_message=f"Failed to read script to parse shebang: {exc}",
         )
+
+    if first_line_bytes.startswith(UTF8_BOM):
+        first_line_bytes = first_line_bytes[len(UTF8_BOM):]
 
     raw_content = first_line_bytes.rstrip(b"\r\n")
     if len(first_line_bytes) > MAX_SHEBANG_BYTES and not first_line_bytes.endswith((b"\n", b"\r")):
@@ -383,7 +427,16 @@ def get_docker_client() -> docker.DockerClient:
     try:
         client = docker.from_env()
         client.ping()
+        info = client.info()
+        if isinstance(info, dict):
+            os_type = info.get("OSType") or info.get("OsType")
+            if os_type and str(os_type).lower() != "linux":
+                raise DockerDaemonError(
+                    f"Docker is running in {os_type} container mode; switch to Linux containers."
+                )
         return client
+    except DockerDaemonError:
+        raise
     except DockerException as exc:
         raise DockerDaemonError(
             f"Cannot connect to Docker daemon: {exc}. "
@@ -397,7 +450,7 @@ def get_docker_client() -> docker.DockerClient:
 
 def extract_snippet(output: str, max_lines: int = SNIPPET_LINE_LIMIT) -> str:
     """Extract the last max_lines of output."""
-    if not output:
+    if not output or max_lines <= 0:
         return ""
     lines = output.strip().splitlines()
     if len(lines) <= max_lines:
@@ -427,20 +480,27 @@ def prepare_script(
     if not os.path.isfile(abs_path):
         return abs_path, None
 
-    # First pass: stream-check if any CRLF exists without loading the entire file into RAM
+    # First pass: stream-check if any CRLF or a leading UTF-8 BOM exists without
+    # loading the entire file into RAM.
     has_crlf = False
+    has_bom = False
+    chunk_size = max(3, chunk_size)
     with open(abs_path, "rb") as f:
         prev_byte = b""
+        first_chunk = True
         while True:
             chunk = f.read(chunk_size)
             if not chunk:
                 break
+            if first_chunk:
+                has_bom = chunk.startswith(UTF8_BOM)
+                first_chunk = False
             if b"\r\n" in chunk or (prev_byte == b"\r" and chunk.startswith(b"\n")):
                 has_crlf = True
                 break
             prev_byte = chunk[-1:]
 
-    if not has_crlf:
+    if not has_crlf and not has_bom:
         return abs_path, None
 
     # Stream-normalize CRLF into temporary file in fixed-size chunks
@@ -448,12 +508,18 @@ def prepare_script(
     try:
         with open(abs_path, "rb") as src:
             carry_cr = False
+            first_chunk = True
             while True:
                 chunk = src.read(chunk_size)
                 if not chunk:
                     if carry_cr:
                         temp_file.write(b"\r")
                     break
+
+                if first_chunk:
+                    if chunk.startswith(UTF8_BOM):
+                        chunk = chunk[len(UTF8_BOM):]
+                    first_chunk = False
 
                 if carry_cr:
                     if chunk.startswith(b"\n"):
@@ -495,6 +561,8 @@ def collect_container_logs(
     bounded rolling byte buffer. Guarantees retained memory never exceeds max_bytes at any step.
     Does not issue non-streaming fallback to prevent unbounded line allocations.
     """
+    if max_bytes <= 0:
+        return ""
     buffer = bytearray()
     try:
         raw = container.logs(stdout=True, stderr=True, tail=tail_lines, stream=True)
@@ -516,11 +584,16 @@ def collect_container_logs(
         else:
             # If logs returned a static payload instead of a generator (e.g. mocked stream)
             if isinstance(raw, str):
-                raw_bytes = raw.encode("utf-8", errors="replace")
+                # Slice the text before encoding so a mocked or alternate client cannot
+                # make this fallback allocate a second copy of an unbounded payload.
+                raw_bytes = raw[-max_bytes:].encode("utf-8", errors="replace")
             elif isinstance(raw, (bytes, bytearray)):
-                raw_bytes = bytes(raw)
+                if max_bytes <= 0:
+                    return ""
+                # Slice the existing bytes object directly; do not copy the full payload first.
+                raw_bytes = raw[-max_bytes:]
             else:
-                raw_bytes = str(raw).encode("utf-8", errors="replace")
+                raw_bytes = str(raw)[-max(0, max_bytes):].encode("utf-8", errors="replace")
             if len(raw_bytes) > max_bytes:
                 raw_bytes = raw_bytes[-max_bytes:]
             return raw_bytes.decode("utf-8", errors="replace")
@@ -574,6 +647,95 @@ def _resolve_shell_command(
     return None, f"Unsupported shell mode: {mode}"
 
 
+def _wrap_with_package_setup(command: Sequence[str], packages: Sequence[str]) -> list[str]:
+    """Preinstall explicit packages with the image's native package manager."""
+    if not packages:
+        return list(command)
+
+    if any(not isinstance(package, str) or not PACKAGE_NAME_RE.fullmatch(package) for package in packages):
+        raise ValueError("Invalid package name")
+
+    package_args = " ".join(shlex.quote(package) for package in packages)
+    install = (
+        "setup_failed() { code=$?; "
+        f"echo '{PACKAGE_SETUP_ERROR_MARKER} package installation failed (exit code' \"$code\" ')' >&2; "
+        "exit \"$code\"; }; "
+        "if command -v apt-get >/dev/null 2>&1; then "
+        "mkdir -p /tmp/opsscript-apt-archives/partial && "
+        "apt-get -o APT::Sandbox::User=root "
+        "-o DPkg::Post-Invoke::= "
+        "-o DPkg::Post-Invoke-Success::= "
+        "-o APT::Update::Post-Invoke-Success::= "
+        "-o Dir::Cache::archives=/tmp/opsscript-apt-archives/ update && "
+        f"apt-get -o APT::Sandbox::User=root "
+        "-o DPkg::Post-Invoke::= "
+        "-o DPkg::Post-Invoke-Success::= "
+        "-o APT::Update::Post-Invoke-Success::= "
+        "-o Dir::Cache::archives=/tmp/opsscript-apt-archives/ "
+        f"install -y --no-install-recommends {package_args} && "
+        "(rm -rf /tmp/opsscript-apt-archives /var/lib/apt/lists/* || true) || setup_failed; "
+        "elif command -v apk >/dev/null 2>&1; then "
+        f"apk add --no-cache {package_args} || setup_failed; "
+        "elif command -v dnf >/dev/null 2>&1; then "
+        f"dnf install -y --setopt=install_weak_deps=False {package_args} || setup_failed; "
+        "elif command -v microdnf >/dev/null 2>&1; then "
+        f"microdnf install -y {package_args} || setup_failed; "
+        "elif command -v yum >/dev/null 2>&1; then "
+        f"yum install -y {package_args} || setup_failed; "
+        f"else echo '{PACKAGE_SETUP_ERROR_MARKER} no supported package manager found (apt-get, apk, dnf, microdnf, yum)' >&2; exit 125; fi"
+    )
+    target_command = " ".join(shlex.quote(part) for part in command)
+    return ["/bin/sh", "-c", f"{install} && exec {target_command}"]
+
+
+def _runtime_option_error(
+    timeout: int | float,
+    mem_limit: str,
+    pids_limit: int,
+    network: str,
+    packages: Sequence[str],
+) -> str | None:
+    """Validate execution options shared by the public runner entry points."""
+    if isinstance(packages, (str, bytes)):
+        return "packages must be a list of package names"
+    try:
+        timeout_value = float(timeout)
+    except (TypeError, ValueError, OverflowError):
+        return "timeout must be a positive number"
+    if not math.isfinite(timeout_value) or timeout_value <= 0:
+        return "timeout must be a positive number"
+    if timeout_value > MAX_TIMEOUT_SECONDS:
+        return f"timeout must not exceed {MAX_TIMEOUT_SECONDS} seconds"
+    if type(pids_limit) is not int or pids_limit < 1:
+        return "pids_limit must be a positive integer"
+    if network not in ("bridge", "none"):
+        return "network must be bridge or none"
+    try:
+        validate_memory_limit(mem_limit)
+        validate_packages(list(packages))
+    except (TypeError, ValueError) as exc:
+        return str(exc)
+    return None
+
+
+def _normalize_matrix(matrix: Sequence[str] | None) -> list[str]:
+    """Validate and normalize container image names for the public runner API."""
+    if matrix is None:
+        return list(DEFAULT_MATRIX)
+    if isinstance(matrix, (str, bytes)):
+        raise ValueError("matrix must be a sequence of container image names")
+    normalized = []
+    for image in matrix:
+        if not isinstance(image, str) or not image.strip():
+            raise ValueError("matrix must contain nonempty container image names")
+        normalized.append(image.strip())
+    if not normalized:
+        raise ValueError("matrix must contain at least one container image")
+    if len(normalized) > MAX_MATRIX_IMAGES:
+        raise ValueError(f"matrix must not contain more than {MAX_MATRIX_IMAGES} images")
+    return normalized
+
+
 def run_on_distro(
     client: docker.DockerClient,
     script_path: str,
@@ -585,12 +747,59 @@ def run_on_distro(
     mem_limit: str = "256m",
     pids_limit: int = 128,
     network: str = "bridge",
+    packages: Sequence[str] | None = None,
     prepared_script_path: str | None = None,
 ) -> SingleResult:
     """
     Run a target script inside an unprivileged, non-interactive container.
     Supports posix, shebang, and auto execution modes with strict resource limits.
     """
+    if isinstance(packages, (str, bytes)):
+        return SingleResult(
+            distro=distro,
+            status=DistroStatus.ERROR,
+            exit_code=None,
+            duration=0.0,
+            output_snippet="",
+            error_message="packages must be a list of package names",
+        )
+    package_list = list(packages or [])
+    option_error = _runtime_option_error(timeout, mem_limit, pids_limit, network, package_list)
+    if option_error:
+        return SingleResult(
+            distro=distro,
+            status=DistroStatus.ERROR,
+            exit_code=None,
+            duration=0.0,
+            output_snippet="",
+            error_message=option_error,
+        )
+    try:
+        poll_interval_value = float(poll_interval)
+    except (TypeError, ValueError, OverflowError):
+        poll_interval_value = float("nan")
+    if not math.isfinite(poll_interval_value) or poll_interval_value <= 0:
+        return SingleResult(
+            distro=distro,
+            status=DistroStatus.ERROR,
+            exit_code=None,
+            duration=0.0,
+            output_snippet="",
+            error_message="poll_interval must be a positive number",
+        )
+    package_list = validate_packages(package_list)
+    timeout = float(timeout)
+    mem_limit = validate_memory_limit(mem_limit)
+    if package_list and network == "none":
+        return SingleResult(
+            distro=distro,
+            status=DistroStatus.ERROR,
+            exit_code=None,
+            duration=0.0,
+            output_snippet="",
+            error_message="Package setup requires network mode 'bridge'",
+        )
+
     try:
         mode = ShellMode(shell_mode)
     except ValueError:
@@ -631,6 +840,8 @@ def run_on_distro(
 
     # Line-ending defense & Windows-safe path preparation
     own_temp_file: tempfile.NamedTemporaryFile | None = None
+    container = None
+    start_time = time.perf_counter()
     if prepared_script_path is not None:
         mount_src = prepared_script_path
     else:
@@ -646,78 +857,107 @@ def run_on_distro(
                 error_message=f"Failed to read/prepare script: {exc}",
             )
 
-    safe_mount_src = normalize_host_path_for_docker(mount_src)
-
-    # Security: Strict unprivileged options and read-only mount
-    volumes = {
-        safe_mount_src: {
-            "bind": "/tmp/target_script.sh",
-            "mode": "ro",
-        }
-    }
-    environment = {
-        "DEBIAN_FRONTEND": "noninteractive",
-        "CI": "true",
-    }
-
-    container = None
-    start_time = time.perf_counter()
-
     try:
+        safe_mount_src = normalize_host_path_for_docker(mount_src)
         try:
-            container = client.containers.create(
-                image=distro,
-                command=command,
-                volumes=volumes,
-                environment=environment,
-                stdin_open=False,
-                tty=False,
-                privileged=False,
-                cap_drop=["ALL"],
-                security_opt=["no-new-privileges:true"],
-                network_mode=network,
-                mem_limit=mem_limit,
-                pids_limit=pids_limit,
-                detach=True,
+            container_command = _wrap_with_package_setup(command, package_list)
+        except (TypeError, ValueError) as exc:
+            return SingleResult(
+                distro=distro,
+                status=DistroStatus.ERROR,
+                exit_code=None,
+                duration=0.0,
+                output_snippet="",
+                error_message=str(exc),
             )
+
+        # Security: Strict unprivileged options and read-only mount
+        volumes = {
+            safe_mount_src: {
+                "bind": "/tmp/target_script.sh",
+                "mode": "ro",
+            }
+        }
+        environment = {
+            "DEBIAN_FRONTEND": "noninteractive",
+            "CI": "true",
+        }
+        create_kwargs = {
+            "image": distro,
+            "command": container_command,
+            "volumes": volumes,
+            "environment": environment,
+            "stdin_open": False,
+            "tty": False,
+            "privileged": False,
+            "cap_drop": ["ALL"],
+            "security_opt": ["no-new-privileges:true"],
+            "network_mode": network,
+            "mem_limit": mem_limit,
+            "pids_limit": pids_limit,
+            "nano_cpus": MAX_NANO_CPUS,
+            # Installers need to write within the disposable container. The host
+            # script remains read-only; do not make package setup change this policy.
+            "read_only": False,
+            "log_config": docker.types.LogConfig(
+                type="json-file", config={"max-size": "1m", "max-file": "2"}
+            ),
+            "detach": True,
+        }
+        try:
+            container = client.containers.create(**create_kwargs)
         except ImageNotFound:
             client.images.pull(distro)
-            container = client.containers.create(
-                image=distro,
-                command=command,
-                volumes=volumes,
-                environment=environment,
-                stdin_open=False,
-                tty=False,
-                privileged=False,
-                cap_drop=["ALL"],
-                security_opt=["no-new-privileges:true"],
-                network_mode=network,
-                mem_limit=mem_limit,
-                pids_limit=pids_limit,
-                detach=True,
-            )
+            container = client.containers.create(**create_kwargs)
 
         container.start()
 
-        # Hard timeout monitoring with container.kill()
+        # Prefer Docker's blocking wait to avoid a tight synchronous reload loop.
+        # Test doubles and older clients that do not return a status dict fall back
+        # to the bounded polling path below.
         timed_out = False
-        while True:
-            elapsed = time.perf_counter() - start_time
-            if elapsed >= timeout:
-                timed_out = True
-                try:
-                    container.kill()
-                except Exception:
-                    pass
-                break
+        wait_error: Exception | None = None
+        wait_result = None
+        wait_fn = getattr(container, "wait", None)
+        if callable(wait_fn):
+            try:
+                wait_result = wait_fn(timeout=max(0.01, float(timeout)))
+            except Exception as exc:
+                if _is_wait_timeout_error(exc):
+                    timed_out = True
+                else:
+                    wait_error = exc
+        if not isinstance(wait_result, dict) and not timed_out:
+            if wait_error is not None:
+                duration = time.perf_counter() - start_time
+                raw_logs = collect_container_logs(container)
+                output = sanitize_log_output(raw_logs)
+                return SingleResult(
+                    distro=distro,
+                    status=DistroStatus.ERROR,
+                    exit_code=None,
+                    duration=duration,
+                    output_snippet=extract_snippet(output),
+                    error_message=f"Container wait failed: {wait_error}",
+                )
+            while True:
+                elapsed = time.perf_counter() - start_time
+                if elapsed >= timeout:
+                    timed_out = True
+                    break
 
-            container.reload()
-            status_str = container.status.lower()
-            if status_str in ("exited", "dead", "stopped"):
-                break
+                container.reload()
+                status_str = container.status.lower()
+                if status_str in ("exited", "dead", "stopped"):
+                    break
 
-            time.sleep(poll_interval)
+                time.sleep(min(poll_interval_value, max(0.0, timeout - elapsed)))
+
+        if timed_out:
+            try:
+                container.kill()
+            except Exception:
+                pass
 
         duration = time.perf_counter() - start_time
 
@@ -735,12 +975,33 @@ def run_on_distro(
                 error_message=f"Execution timed out after {timeout} seconds (container killed)",
             )
 
-        container.reload()
-        state = getattr(container, "attrs", {}).get("State", {})
-        exit_code = state.get("ExitCode")
+        try:
+            container.reload()
+            state = getattr(container, "attrs", {}).get("State", {})
+        except Exception:
+            state = {}
+        wait_exit_code = wait_result.get("StatusCode") if isinstance(wait_result, dict) else None
+        exit_code = wait_exit_code if isinstance(wait_exit_code, int) else state.get("ExitCode")
 
         if exit_code is None:
-            exit_code = 0 if container.status == "exited" else 1
+            return SingleResult(
+                distro=distro,
+                status=DistroStatus.ERROR,
+                exit_code=None,
+                duration=duration,
+                output_snippet=extract_snippet(output),
+                error_message="Container exited without a Docker exit code; execution result is unknown",
+            )
+
+        if package_list and exit_code != 0 and PACKAGE_SETUP_ERROR_MARKER in output:
+            return SingleResult(
+                distro=distro,
+                status=DistroStatus.ERROR,
+                exit_code=exit_code,
+                duration=duration,
+                output_snippet=extract_snippet(output),
+                error_message="Container package setup failed before the script ran",
+            )
 
         if exit_code == 0:
             return SingleResult(
@@ -753,13 +1014,17 @@ def run_on_distro(
             )
         else:
             diagnostic = extract_failure_diagnostic(output, exit_code=exit_code, distro=distro)
+            if state.get("OOMKilled"):
+                err_msg = f"Container exceeded memory limit ({mem_limit}) and was killed by OOM killer (exit code: {exit_code})"
+            else:
+                err_msg = f"Script failed with non-zero exit code: {exit_code}"
             return SingleResult(
                 distro=distro,
                 status=DistroStatus.FAIL,
                 exit_code=exit_code,
                 duration=duration,
                 output_snippet=extract_snippet(output),
-                error_message=f"Script failed with non-zero exit code: {exit_code}",
+                error_message=err_msg,
                 diagnostic=diagnostic,
             )
 
@@ -799,69 +1064,160 @@ def run_matrix(
     mem_limit: str = "256m",
     pids_limit: int = 128,
     network: str = "bridge",
+    packages: Sequence[str] | None = None,
+    repeat: int = 1,
 ) -> RunReport:
     """
     Run the compatibility check across all specified Linux distributions,
     optionally running containers concurrently with ThreadPoolExecutor.
     Results strictly preserve the original matrix order.
     """
+    if type(repeat) is not int or repeat < 1:
+        raise ValueError("repeat must be a positive integer")
+    if repeat > MAX_REPEAT_ATTEMPTS:
+        raise ValueError(f"repeat must not exceed {MAX_REPEAT_ATTEMPTS}")
+
     try:
         mode = ShellMode(shell_mode)
     except ValueError:
         mode = None
 
+    distro_list = _normalize_matrix(matrix)
+
     abs_script = os.path.abspath(script_path)
+    if not os.path.exists(abs_script):
+        return RunReport(
+            results=[
+                SingleResult(
+                    distro=d,
+                    status=DistroStatus.ERROR,
+                    exit_code=None,
+                    duration=0.0,
+                    output_snippet="",
+                    error_message=f"Target script does not exist: {abs_script}",
+                )
+                for d in distro_list
+            ],
+            total_duration=0.0,
+            all_passed=False,
+        )
+    if not os.path.isfile(abs_script):
+        return RunReport(
+            results=[
+                SingleResult(
+                    distro=d,
+                    status=DistroStatus.ERROR,
+                    exit_code=None,
+                    duration=0.0,
+                    output_snippet="",
+                    error_message=f"Target script path is not a regular file: {abs_script}",
+                )
+                for d in distro_list
+            ],
+            total_duration=0.0,
+            all_passed=False,
+        )
+
     parsed_shebang: ShebangParseResult | None = None
     if mode is not None and mode != ShellMode.POSIX:
-        if os.path.isfile(abs_script):
-            parsed_shebang = inspect_shebang(abs_script)
+        parsed_shebang = inspect_shebang(abs_script)
 
-    distro_list = list(matrix) if matrix else DEFAULT_MATRIX
+    if isinstance(packages, (str, bytes)):
+        raise ValueError("packages must be a list of package names")
+    package_list = list(packages or [])
+    option_error = _runtime_option_error(timeout, mem_limit, pids_limit, network, package_list)
+    if option_error:
+        raise ValueError(option_error)
+    package_list = validate_packages(package_list)
+    mem_limit = validate_memory_limit(mem_limit)
+    if package_list and network == "none":
+        raise ValueError("Package setup requires network mode 'bridge'")
     docker_client = client or get_docker_client()
 
-    effective_jobs = jobs if (jobs is not None and jobs > 0) else min(2, len(distro_list))
-    effective_jobs = max(1, effective_jobs)
+    if jobs is not None and (type(jobs) is not int or jobs < 1):
+        raise ValueError("jobs must be a positive integer")
+    effective_jobs = jobs if jobs is not None else min(2, len(distro_list))
+    effective_jobs = min(max(1, effective_jobs), len(distro_list), MAX_CONCURRENT_JOBS)
 
     # Prepare script once for all parallel matrix workers
     shared_temp_file: tempfile.NamedTemporaryFile | None = None
-    prepared_script: str = abs_script
-    if os.path.isfile(abs_script):
-        try:
-            prepared_script, shared_temp_file = prepare_script(abs_script)
-        except Exception as exc:
-            return RunReport(
-                results=[
-                    SingleResult(
-                        distro=d,
-                        status=DistroStatus.ERROR,
-                        exit_code=None,
-                        duration=0.0,
-                        output_snippet="",
-                        error_message=f"Failed to read/prepare script: {exc}",
-                    )
-                    for d in distro_list
-                ],
-                total_duration=0.0,
-                all_passed=False,
-            )
+    try:
+        prepared_script, shared_temp_file = prepare_script(abs_script)
+    except Exception as exc:
+        return RunReport(
+            results=[
+                SingleResult(
+                    distro=d,
+                    status=DistroStatus.ERROR,
+                    exit_code=None,
+                    duration=0.0,
+                    output_snippet="",
+                    error_message=f"Failed to read/prepare script: {exc}",
+                )
+                for d in distro_list
+            ],
+            total_duration=0.0,
+        )
 
     start_total = time.perf_counter()
     results: list[SingleResult] = [None] * len(distro_list)  # type: ignore
 
     def _worker(index: int, distro_name: str) -> tuple[int, SingleResult]:
-        res = run_on_distro(
-            client=docker_client,
-            script_path=script_path,
-            distro=distro_name,
-            timeout=timeout,
-            shell_mode=shell_mode,
-            parsed_shebang=parsed_shebang,
-            mem_limit=mem_limit,
-            pids_limit=pids_limit,
-            network=network,
-            prepared_script_path=prepared_script,
+        attempts: list[SingleResult] = []
+        for _ in range(repeat):
+            attempts.append(run_on_distro(
+                client=docker_client,
+                script_path=script_path,
+                distro=distro_name,
+                timeout=timeout,
+                shell_mode=shell_mode,
+                parsed_shebang=parsed_shebang,
+                mem_limit=mem_limit,
+                pids_limit=pids_limit,
+                network=network,
+                packages=package_list,
+                prepared_script_path=prepared_script,
+            ))
+
+        if repeat == 1:
+            return index, attempts[0]
+
+        passed = sum(result.status == DistroStatus.PASS for result in attempts)
+        failed = repeat - passed
+        non_passed = [r for r in attempts if r.status != DistroStatus.PASS]
+        # Preserve the most actionable failure when one attempt also reports a
+        # transient daemon error. A diagnostic-bearing result is more useful
+        # than an earlier transport error with no exit code.
+        representative = (
+            next((r for r in non_passed if r.diagnostic is not None), None)
+            or next((r for r in non_passed if r.exit_code not in (None, 0)), None)
+            or (non_passed[0] if non_passed else attempts[-1])
         )
-        return index, res
+        if passed and failed:
+            status = DistroStatus.FLAKY
+            message = (
+                f"Runtime was non-deterministic: {passed}/{repeat} attempts passed "
+                f"and {failed}/{repeat} failed"
+            )
+            error_message = message if representative.error_message is None else (
+                f"{message}; {representative.error_message}"
+            )
+        else:
+            status = representative.status
+            error_message = representative.error_message
+
+        return index, SingleResult(
+            distro=distro_name,
+            status=status,
+            exit_code=representative.exit_code,
+            duration=sum(r.duration for r in attempts),
+            output_snippet=representative.output_snippet,
+            error_message=error_message,
+            diagnostic=representative.diagnostic,
+            attempts=repeat,
+            passed_attempts=passed,
+            failed_attempts=failed,
+        )
 
     try:
         if effective_jobs == 1 or len(distro_list) <= 1:

@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "opsscript-gate"
-version = "0.5.0"
-description = "Run Linux shell scripts across Debian, Ubuntu and Alpine before release to catch runtime compatibility failures"
+version = "0.9.4"
+description = "Cross-distro shell script compatibility and portability checker for Debian, Ubuntu, and Alpine. Runs real containers to diagnose command not found."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
@@ -23,9 +23,29 @@ keywords = [
     "cross-distro",
     "posix",
     "testing",
+    "installer",
+    "bootstrap",
+    "debian",
+    "ubuntu",
+    "alpine",
+    "shellcheck-alternative",
+    "shellcheck",
+    "shell-portability",
+    "installer-testing",
+    "busybox",
+    "command-not-found",
+    "shell-script-testing",
+    "shell-runtime",
+    "real-container-testing",
+    "distribution-compatibility",
+    "runtime-compatibility",
+    "portable-shell",
+    "apt-get",
+    "apk",
+    "bashisms",
 ]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Intended Audience :: System Administrators",
     "License :: OSI Approved :: MIT License",
@@ -41,14 +61,19 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/Mresyzz/opsscript-gate"
+Homepage = "https://mresyzz.github.io/opsscript-gate/"
+Demo = "https://mresyzz.github.io/opsscript-gate/"
 Repository = "https://github.com/Mresyzz/opsscript-gate"
 Issues = "https://github.com/Mresyzz/opsscript-gate/issues"
 Changelog = "https://github.com/Mresyzz/opsscript-gate/blob/main/CHANGELOG.md"
+Documentation = "https://github.com/Mresyzz/opsscript-gate/tree/main/docs"
+Troubleshooting = "https://github.com/Mresyzz/opsscript-gate/blob/main/docs/command-not-found.md"
 
 [project.optional-dependencies]
 test = [
     "pytest>=8.0.0",
+    "markdown-it-py>=3.0.0",
+    "PyYAML>=6.0.0",
 ]
 
 [project.scripts]

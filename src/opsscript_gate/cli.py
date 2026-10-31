@@ -8,15 +8,17 @@ import time
 from pathlib import Path
 
 from opsscript_gate import __version__
-from opsscript_gate.discovery import discover_scripts
-from opsscript_gate.config import DEFAULTS, PRESETS, init_project, load_config
+from opsscript_gate.discovery import discover_changed_scripts, discover_scripts
+from opsscript_gate.config import DEFAULTS, MAX_MATRIX_IMAGES, MAX_REPEAT_ATTEMPTS, MAX_TIMEOUT_SECONDS, PRESETS, init_project, load_config, validate_memory_limit, validate_packages
 from opsscript_gate.models import MultiScriptReport, RunReport
 from opsscript_gate.reporter import (
     emit_github_annotations,
     format_github_summary,
     format_json,
+    format_multi_sarif,
     format_multi_github_summary,
     format_multi_terminal_table,
+    format_sarif,
     format_terminal_table,
     write_github_step_summary,
 )
@@ -24,8 +26,20 @@ from opsscript_gate.runner import (
     DEFAULT_MATRIX,
     DEFAULT_TIMEOUT,
     DockerDaemonError,
+    get_docker_client,
     run_matrix,
 )
+
+CRITICAL_PROJECT_FILES: tuple[str, ...] = (
+    "pyproject.toml",
+    "action.yml",
+    "action.yaml",
+    "setup.py",
+    "setup.cfg",
+    "README.md",
+    "CHANGELOG.md",
+)
+
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -43,6 +57,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers = parser.add_subparsers(dest="command", help="Available subcommands")
     subparsers.add_parser("init", help="Create project configuration and GitHub workflow")
+    doctor_parser = subparsers.add_parser(
+        "doctor",
+        help="Check the local environment before running containers",
+    )
+    doctor_parser.add_argument(
+        "--format",
+        choices=["table", "json"],
+        default="table",
+        help="Output format: 'table' (default) or 'json'",
+    )
 
     # 'run' subcommand
     run_parser = subparsers.add_parser(
@@ -79,10 +103,16 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Hard timeout in seconds per container (default: {DEFAULT_TIMEOUT}s)",
     )
     run_parser.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        help="Repeat each distribution run to detect flaky runtime behavior (default: 1)",
+    )
+    run_parser.add_argument(
         "--format",
-        choices=["table", "markdown", "json"],
+        choices=["table", "markdown", "json", "sarif"],
         default="table",
-        help="Output report format: 'table' (default ASCII), 'markdown', or 'json'",
+        help="Output report format: 'table' (default ASCII), 'markdown', 'json', or 'sarif'",
     )
     run_parser.add_argument(
         "--shell",
@@ -108,6 +138,16 @@ def build_parser() -> argparse.ArgumentParser:
         default="bridge",
         help="Network mode for containers: 'bridge' or 'none' (default: bridge)",
     )
+    run_parser.add_argument(
+        "--packages",
+        action="append",
+        default=None,
+        help="Optional comma-separated packages to install in each container before running (repeatable; requires network=bridge)",
+    )
+    run_parser.add_argument(
+        "--changed-since",
+        help="Only test shell scripts changed between this Git revision and HEAD",
+    )
 
     run_parser.add_argument("--config", help="Project JSON configuration (default: .opsscript-gate.json)")
     run_parser.add_argument("--preset", choices=list(PRESETS), help="Named distribution matrix")
@@ -123,7 +163,61 @@ def parse_matrix_argument(matrix_raw: str | None) -> list[str]:
     if not matrix_raw:
         return DEFAULT_MATRIX
     images = [img.strip() for img in matrix_raw.split(",") if img.strip()]
+    if len(images) > MAX_MATRIX_IMAGES:
+        raise ValueError(f"matrix must not contain more than {MAX_MATRIX_IMAGES} images")
     return images if images else DEFAULT_MATRIX
+
+
+def parse_packages_argument(packages_raw: list[str] | None) -> list[str]:
+    """Parse repeated comma/newline-separated package arguments."""
+    if not packages_raw:
+        return []
+    packages: list[str] = []
+    for raw in packages_raw:
+        for package in raw.replace("\r", "\n").replace(",", "\n").split("\n"):
+            name = package.strip()
+            if name:
+                packages.append(name)
+    return validate_packages(packages)
+
+
+def run_checked_matrix(
+    args: argparse.Namespace, script_path: str, matrix: list[str]
+) -> RunReport | None:
+    """Run one script and normalize user-facing Docker/runtime errors."""
+    try:
+        return run_matrix(
+            script_path=script_path,
+            matrix=matrix,
+            timeout=args.timeout,
+            shell_mode=args.shell,
+            jobs=args.jobs,
+            mem_limit=args.mem_limit,
+            pids_limit=args.pids_limit,
+            network=args.network,
+            packages=args.packages,
+            repeat=args.repeat,
+        )
+    except DockerDaemonError as err:
+        sys.stderr.write(f"Docker Error: {err}\n")
+    except Exception as err:
+        sys.stderr.write(f"Unexpected Error: {err}\n")
+    return None
+
+
+def _output_overwrites_protected(output_path: Path, protected: list[Path]) -> bool:
+    """Reject paths that resolve to or share an inode with a protected file."""
+    if output_path in protected:
+        return True
+    if not output_path.exists():
+        return False
+    for target in protected:
+        try:
+            if target.exists() and os.path.samefile(output_path, target):
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -145,6 +239,54 @@ def main(argv: list[str] | None = None) -> int:
             sys.stderr.write(f"Error: {err}\n")
             return 1
 
+    if args.command == "doctor":
+        checks = [
+            {
+                "name": "python",
+                "ok": sys.version_info >= (3, 10),
+                "detail": f"Python {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+            }
+        ]
+        try:
+            get_docker_client()
+            checks.append({"name": "docker", "ok": True, "detail": "Docker daemon is reachable"})
+        except DockerDaemonError as err:
+            checks.append({"name": "docker", "ok": False, "detail": str(err)})
+
+        config_path = Path(".opsscript-gate.json")
+        if not config_path.is_file():
+            checks.append({
+                "name": "project",
+                "ok": True,
+                "detail": "No project config (optional)",
+            })
+        else:
+            try:
+                load_config(str(config_path))
+            except (OSError, ValueError) as err:
+                checks.append({
+                    "name": "project",
+                    "ok": False,
+                    "detail": f"Invalid {config_path}: {err}",
+                })
+            else:
+                checks.append({
+                    "name": "project",
+                    "ok": True,
+                    "detail": f"Found and validated {config_path}",
+                })
+        passed = all(check["ok"] for check in checks)
+        if args.format == "json":
+            print(json.dumps({"status": "PASS" if passed else "FAIL", "checks": checks}, indent=2))
+        else:
+            print("OpsScript Gate doctor")
+            for check in checks:
+                marker = "PASS" if check["ok"] else "FAIL"
+                print(f"[{marker}] {check['name']}: {check['detail']}")
+            if not passed:
+                print("Run `opsscript-gate init` after fixing the failed check, then preview with `opsscript-gate run --dry-run`.")
+        return 0 if passed else 1
+
     if args.command == "run":
         try:
             config = load_config(args.config)
@@ -160,80 +302,129 @@ def main(argv: list[str] | None = None) -> int:
                 args.preset = None
             if "--preset" in explicit:
                 args.matrix = None
-            for key in ("jobs", "timeout", "pids_limit", "max_scripts"):
+            for key in ("jobs", "timeout", "pids_limit", "max_scripts", "repeat"):
                 value = getattr(args, key)
                 if value is not None and value < 1:
                     raise ValueError(f"{key.replace('_', '-')} must be positive")
+            if args.repeat > MAX_REPEAT_ATTEMPTS:
+                raise ValueError(f"repeat must not exceed {MAX_REPEAT_ATTEMPTS}")
+            if args.timeout > MAX_TIMEOUT_SECONDS:
+                raise ValueError(f"timeout must not exceed {MAX_TIMEOUT_SECONDS} seconds")
             if args.network not in ("bridge", "none"):
                 raise ValueError("network must be bridge or none")
+            args.mem_limit = validate_memory_limit(args.mem_limit)
+            args.packages = parse_packages_argument(args.packages)
+            if args.packages and args.network == "none":
+                raise ValueError("packages require network=bridge")
             if args.matrix is not None and not any(x.strip() for x in args.matrix.split(",")):
                 raise ValueError("matrix must contain at least one image")
         except ValueError as err:
             sys.stderr.write(f"Error: {err}\n")
             return 1
         # Resolve target script(s)
+        if args.script_path and args.changed_since:
+            sys.stderr.write("Error: use either a script path or --changed-since, not both\n")
+            return 1
+        changed_selection = bool(args.changed_since)
         if args.script_path:
             if not os.path.isfile(args.script_path):
                 sys.stderr.write(f"Error: Script file not found: {args.script_path}\n")
                 return 1
+            try:
+                with open(args.script_path, "rb") as probe:
+                    probe.read(1)
+            except OSError as err:
+                sys.stderr.write(f"Error: Cannot read script {args.script_path}: {err}\n")
+                return 1
             target_scripts = [args.script_path]
+        elif changed_selection:
+            try:
+                target_scripts = discover_changed_scripts(
+                    ".", since=args.changed_since, max_scripts=args.max_scripts, exclude=args.exclude
+                )
+            except ValueError as err:
+                sys.stderr.write(f"Error: {err}\n")
+                return 1
         else:
             try:
                 target_scripts = discover_scripts(".", max_scripts=args.max_scripts, exclude=args.exclude)
             except ValueError as err:
                 sys.stderr.write(f"Error: {err}\n")
                 return 1
-            if not target_scripts:
+            if not target_scripts and not changed_selection:
                 sys.stderr.write(
                     "No shell scripts discovered in the current directory. "
                     "Please specify a script path explicitly.\n"
                 )
                 return 1
 
-        matrix = PRESETS[args.preset] if args.preset else parse_matrix_argument(args.matrix)
+        try:
+            matrix = PRESETS[args.preset] if args.preset else parse_matrix_argument(args.matrix)
+        except ValueError as err:
+            sys.stderr.write(f"Error: {err}\n")
+            return 1
         if args.output:
             output_path = Path(args.output).resolve()
+            if output_path.is_dir():
+                sys.stderr.write("Error: output must name a file, not an existing directory\n")
+                return 1
+            if any(part == ".git" for part in output_path.parts):
+                sys.stderr.write("Error: output must not target files inside .git directory\n")
+                return 1
             protected = [Path(p).resolve() for p in target_scripts]
             protected.append(Path(args.config or ".opsscript-gate.json").resolve())
-            if output_path in protected:
+            for critical_name in CRITICAL_PROJECT_FILES:
+                critical_path = Path(critical_name).resolve()
+                if critical_path.exists():
+                    protected.append(critical_path)
+            if _output_overwrites_protected(output_path, protected):
                 sys.stderr.write("Error: output must not overwrite a target script or configuration\n")
                 return 1
 
         if args.dry_run:
             plan = {"dry_run": True, "scripts": target_scripts, "matrix": matrix,
-                    "executions": len(target_scripts) * len(matrix), "shell": args.shell,
-                    "network": args.network, "timeout": args.timeout}
+                    "executions": len(target_scripts) * len(matrix) * args.repeat, "shell": args.shell,
+                    "network": args.network, "packages": args.packages, "timeout": args.timeout,
+                    "repeat": args.repeat}
+            if changed_selection:
+                plan["changed_since"] = args.changed_since
             output = json.dumps(plan, indent=2) if args.format == "json" else (
                 "Execution preview (no scripts executed)\n"
                 + "\n".join(f"  {path}" for path in target_scripts)
                 + f"\nImages: {', '.join(matrix)}\nContainer executions: {plan['executions']}"
-                + f"\nShell: {args.shell} | Network: {args.network} | Timeout: {args.timeout}s"
+                + (f"\nPackages: {', '.join(args.packages)}" if args.packages else "")
+                + f"\nShell: {args.shell} | Network: {args.network} | Timeout: {args.timeout}s | Repeat: {args.repeat}"
             )
+            return 0 if publish_output(output, args.output) else 1
+
+        if not target_scripts:
+            message = f"No changed shell scripts since {args.changed_since}; skipping compatibility checks."
+            if args.format == "json":
+                output = json.dumps({
+                    "all_passed": True,
+                    "changed_since": args.changed_since,
+                    "scripts": [],
+                    "skipped": True,
+                }, indent=2)
+            elif args.format == "sarif":
+                output = format_sarif(RunReport([]))
+            elif args.format == "markdown":
+                output = format_github_summary(RunReport([]))
+            else:
+                output = message
             return 0 if publish_output(output, args.output) else 1
 
         if len(target_scripts) == 1:
             script_path = target_scripts[0]
-            try:
-                report = run_matrix(
-                    script_path=script_path,
-                    matrix=matrix,
-                    timeout=args.timeout,
-                    shell_mode=args.shell,
-                    jobs=args.jobs,
-                    mem_limit=args.mem_limit,
-                    pids_limit=args.pids_limit,
-                    network=args.network,
-                )
-            except DockerDaemonError as err:
-                sys.stderr.write(f"Docker Error: {err}\n")
-                return 1
-            except Exception as err:
-                sys.stderr.write(f"Unexpected Error: {err}\n")
+            report = run_checked_matrix(args, script_path, matrix)
+            if report is None:
                 return 1
 
             # Format report output
             if args.format == "json":
                 output = format_json(report)
+            elif args.format == "sarif":
+                output = format_sarif(report, script_path=script_path)
             elif args.format == "markdown":
                 output = format_github_summary(report, script_path=script_path)
             else:
@@ -243,7 +434,8 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
 
             # Emit GitHub line annotations if in CI
-            emit_github_annotations(report, script_path=script_path)
+            if args.format not in ("json", "sarif"):
+                emit_github_annotations(report, script_path=script_path)
 
             # Automatic GitHub Actions Step Summary injection
             write_github_step_summary(report, script_path=script_path)
@@ -255,26 +447,13 @@ def main(argv: list[str] | None = None) -> int:
         multi_start = time.perf_counter()
 
         for script_path in target_scripts:
-            try:
-                report = run_matrix(
-                    script_path=script_path,
-                    matrix=matrix,
-                    timeout=args.timeout,
-                    shell_mode=args.shell,
-                    jobs=args.jobs,
-                    mem_limit=args.mem_limit,
-                    pids_limit=args.pids_limit,
-                    network=args.network,
-                )
-            except DockerDaemonError as err:
-                sys.stderr.write(f"Docker Error: {err}\n")
-                return 1
-            except Exception as err:
-                sys.stderr.write(f"Unexpected Error: {err}\n")
+            report = run_checked_matrix(args, script_path, matrix)
+            if report is None:
                 return 1
 
             multi_reports[script_path] = report
-            emit_github_annotations(report, script_path=script_path)
+            if args.format not in ("json", "sarif"):
+                emit_github_annotations(report, script_path=script_path)
 
         total_duration = time.perf_counter() - multi_start
         all_passed = all(r.all_passed for r in multi_reports.values())
@@ -286,6 +465,8 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.format == "json":
             output = format_json(multi_report)
+        elif args.format == "sarif":
+            output = format_multi_sarif(multi_report)
         elif args.format == "markdown":
             output = format_multi_github_summary(multi_report)
         else:
@@ -302,15 +483,17 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def publish_output(output: str, filename: str | None) -> bool:
+    # Always keep the terminal result visible even when persistence fails.
+    print(output)
     if filename:
         try:
             path = Path(filename)
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(output + "\n", encoding="utf-8")
+            with path.open("w", encoding="utf-8", newline="\n") as stream:
+                stream.write(output + "\n")
         except OSError as err:
             sys.stderr.write(f"Error writing report: {err}\n")
             return False
-    print(output)
     return True
 
 

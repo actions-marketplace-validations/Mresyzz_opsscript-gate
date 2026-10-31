@@ -4,6 +4,15 @@ This roadmap tracks features delivered in recent releases and areas under consid
 
 ---
 
+## Delivered in v0.9.0
+
+- [x] **Flaky Runtime Detection (`--repeat` / `repeat`)**: Repeat each distribution
+  run and report mixed pass/fail outcomes as `FLAKY` with attempt counts.
+- [x] **Bounded Configuration Loading**: Reject oversized project configuration files
+  before parsing them.
+- [x] **Blocking Container Wait**: Prefer Docker's wait API over repeated synchronous
+  status reloads while retaining a test-double fallback.
+
 ## Delivered in v0.4.0
 
 - [x] **High-confidence Line-level GitHub Actions Annotations**: Emits safe `::error` annotations linking failure lines directly on pull request file diffs.
@@ -25,7 +34,14 @@ This roadmap tracks features delivered in recent releases and areas under consid
 
 ---
 
-## Planned for Future Releases (v0.5.0+)
+## Delivered in v0.5.0 and v0.6.0
+
+- [x] Project configuration with strict validation and CLI/Action precedence.
+- [x] Dry-run plans, `minimal` and `ubuntu` presets, exclusions, and saved reports.
+- [x] Bounded discovery with symlink and oversized-file protection.
+- [x] Changed-script selection with `--changed-since` for pull requests.
+
+## Planned for Future Releases
 
 ### 1. Matrix & Distribution Presets
 - [ ] **RPM-based distributions**: Evaluate support for Enterprise Linux baselines (e.g. Rocky Linux 9, AlmaLinux, Fedora).

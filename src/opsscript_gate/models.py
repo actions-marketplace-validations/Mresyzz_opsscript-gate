@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
@@ -11,6 +11,7 @@ class DistroStatus(str, Enum):
     FAIL = "FAIL"
     TIMED_OUT = "TIMED_OUT"
     ERROR = "ERROR"
+    FLAKY = "FLAKY"
 
 
 class ShellMode(str, Enum):
@@ -29,6 +30,7 @@ class FailureDiagnostic:
     line: int | None = None
     distro: str | None = None
     hint: str | None = None
+    suggested_package: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -43,6 +45,8 @@ class FailureDiagnostic:
             d["distro"] = self.distro
         if self.hint is not None:
             d["hint"] = self.hint
+        if self.suggested_package is not None:
+            d["suggested_package"] = self.suggested_package
         return d
 
 
@@ -56,6 +60,32 @@ class SingleResult:
     output_snippet: str = ""
     error_message: str | None = None
     diagnostic: FailureDiagnostic | None = None
+    attempts: int = 1
+    passed_attempts: int | None = None
+    failed_attempts: int | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.attempts) is not int or self.attempts < 1:
+            raise ValueError("attempts must be a positive integer")
+        for field_name, value in (
+            ("passed_attempts", self.passed_attempts),
+            ("failed_attempts", self.failed_attempts),
+        ):
+            if value is not None and type(value) is not int:
+                raise ValueError(f"{field_name} must be an integer")
+        if self.passed_attempts is None and self.failed_attempts is None:
+            if self.status == DistroStatus.PASS:
+                self.passed_attempts, self.failed_attempts = self.attempts, 0
+            else:
+                self.passed_attempts, self.failed_attempts = 0, self.attempts
+        elif self.passed_attempts is None and self.failed_attempts is not None:
+            self.passed_attempts = self.attempts - self.failed_attempts
+        elif self.failed_attempts is None and self.passed_attempts is not None:
+            self.failed_attempts = self.attempts - self.passed_attempts
+        if self.passed_attempts < 0 or self.failed_attempts < 0:
+            raise ValueError("attempt counts cannot be negative")
+        if self.passed_attempts + self.failed_attempts != self.attempts:
+            raise ValueError("passed_attempts + failed_attempts must equal attempts")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -66,6 +96,10 @@ class SingleResult:
             "output_snippet": self.output_snippet,
             "error_message": self.error_message,
             "diagnostic": self.diagnostic.to_dict() if self.diagnostic is not None else None,
+            "attempts": self.attempts,
+            "passed_attempts": self.passed_attempts,
+            "failed_attempts": self.failed_attempts,
+            "flaky": self.status == DistroStatus.FLAKY,
         }
 
 
@@ -79,8 +113,6 @@ class RunReport:
     def __post_init__(self) -> None:
         if self.results:
             self.all_passed = all(r.status == DistroStatus.PASS for r in self.results)
-        else:
-            self.all_passed = True
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -100,8 +132,6 @@ class MultiScriptReport:
     def __post_init__(self) -> None:
         if self.reports:
             self.all_passed = all(r.all_passed for r in self.reports.values())
-        else:
-            self.all_passed = True
 
     def to_dict(self) -> dict[str, Any]:
         return {

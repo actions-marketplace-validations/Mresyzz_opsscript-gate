@@ -7,8 +7,9 @@ from unittest import mock
 
 import pytest
 from docker.errors import DockerException
+from markdown_it import MarkdownIt
 
-from opsscript_gate.cli import build_parser, main, parse_matrix_argument
+from opsscript_gate.cli import build_parser, main, parse_matrix_argument, parse_packages_argument, publish_output
 from opsscript_gate.discovery import discover_scripts, is_shell_script
 from opsscript_gate.models import DistroStatus, FailureDiagnostic, MultiScriptReport, RunReport, ShellMode, SingleResult
 from opsscript_gate.remediation import generate_remediation_hint, REMEDIATION_RULES
@@ -19,8 +20,10 @@ from opsscript_gate.reporter import (
     format_github_annotations,
     format_github_summary,
     format_json,
+    format_multi_sarif,
     format_multi_github_summary,
     format_multi_terminal_table,
+    format_sarif,
     format_terminal_table,
     write_github_step_summary,
 )
@@ -28,6 +31,8 @@ from opsscript_gate.runner import (
     DEFAULT_MATRIX,
     DEFAULT_POSIX_COMMAND,
     DEFAULT_TIMEOUT,
+    MAX_CONCURRENT_JOBS,
+    MAX_NANO_CPUS,
     SUPPORTED_SHEBANG_COMMANDS,
     DockerDaemonError,
     ShebangParseResult,
@@ -41,6 +46,7 @@ from opsscript_gate.runner import (
     run_matrix,
     run_on_distro,
     sanitize_diagnostic_text,
+    _wrap_with_package_setup,
 )
 
 
@@ -88,8 +94,17 @@ def test_models_all_passed():
     assert report.all_passed is True
 
 
+def test_single_result_infers_attempt_counts_for_repeated_result():
+    result = SingleResult("alpine:3.20", DistroStatus.PASS, 0, 0.1, attempts=3)
+    assert result.passed_attempts == 3
+    assert result.failed_attempts == 0
+    with pytest.raises(ValueError, match="attempts"):
+        SingleResult("alpine:3.20", DistroStatus.PASS, 0, 0.1, attempts=1.5)
+
+
 def test_extract_snippet():
     assert extract_snippet("") == ""
+    assert extract_snippet("line 1\nline 2", max_lines=0) == ""
     short_text = "line 1\nline 2"
     assert extract_snippet(short_text, max_lines=5) == short_text
 
@@ -148,6 +163,14 @@ def test_get_docker_client_failure():
         assert "Cannot connect to Docker daemon" in str(excinfo.value)
 
 
+def test_get_docker_client_rejects_windows_container_mode():
+    client = mock.MagicMock()
+    client.info.return_value = {"OSType": "windows"}
+    with mock.patch("docker.from_env", return_value=client):
+        with pytest.raises(DockerDaemonError, match="Linux containers"):
+            get_docker_client()
+
+
 def test_run_on_distro_missing_script(tmp_path):
     mock_client = mock.MagicMock()
     missing_file = str(tmp_path / "non_existent.sh")
@@ -195,6 +218,133 @@ def test_run_on_distro_pass_mock(tmp_path):
     mock_container.remove.assert_called_once_with(force=True)
 
 
+def test_run_on_distro_uses_wait_status_code(tmp_path):
+    script_file = tmp_path / "wait-status.sh"
+    script_file.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    mock_client = mock.MagicMock()
+    mock_container = mock.MagicMock()
+    mock_container.wait.return_value = {"StatusCode": 127}
+    mock_container.attrs = {"State": {"ExitCode": 0}}
+    mock_container.status = "exited"
+    mock_container.logs.return_value = b"sh: line 1: missing: not found\n"
+    mock_client.containers.create.return_value = mock_container
+
+    result = run_on_distro(mock_client, str(script_file), "alpine:3.20")
+
+    assert result.status == DistroStatus.FAIL
+    assert result.exit_code == 127
+
+
+def test_run_on_distro_marker_in_script_output_is_not_setup_error(tmp_path):
+    script_file = tmp_path / "marker.sh"
+    script_file.write_text("#!/bin/sh\necho OPSSCRIPT_GATE_SETUP_ERROR: demo\nexit 0\n", encoding="utf-8")
+    mock_client = mock.MagicMock()
+    mock_container = mock.MagicMock()
+    mock_container.attrs = {"State": {"ExitCode": 0}}
+    mock_container.status = "exited"
+    mock_container.logs.return_value = b"OPSSCRIPT_GATE_SETUP_ERROR: demo\n"
+    mock_client.containers.create.return_value = mock_container
+
+    result = run_on_distro(mock_client, str(script_file), "debian:12-slim")
+
+    assert result.status == DistroStatus.PASS
+
+
+def test_run_on_distro_validates_direct_api_options(tmp_path):
+    script_file = tmp_path / "options.sh"
+    script_file.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    result = run_on_distro(
+        mock.MagicMock(), str(script_file), "debian:12-slim", network="host", pids_limit=0
+    )
+    assert result.status == DistroStatus.ERROR
+    assert "pids_limit" in (result.error_message or "")
+    invalid_memory = run_on_distro(
+        mock.MagicMock(), str(script_file), "debian:12-slim", mem_limit="unlimited"
+    )
+    assert invalid_memory.status == DistroStatus.ERROR
+    assert "mem_limit" in (invalid_memory.error_message or "")
+
+
+def test_run_on_distro_rejects_invalid_poll_interval(tmp_path):
+    script_file = tmp_path / "poll.sh"
+    script_file.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    result = run_on_distro(
+        mock.MagicMock(), str(script_file), "debian:12-slim", poll_interval=0
+    )
+    assert result.status == DistroStatus.ERROR
+    assert "poll_interval" in (result.error_message or "")
+
+
+def test_run_on_distro_package_setup_wraps_command(tmp_path):
+    script_file = tmp_path / "test.sh"
+    script_file.write_text("#!/bin/sh\necho OK\n", encoding="utf-8")
+
+    mock_client = mock.MagicMock()
+    mock_container = mock.MagicMock()
+    mock_container.status = "exited"
+    mock_container.attrs = {"State": {"ExitCode": 0}}
+    mock_container.logs.return_value = b"OK\n"
+    mock_client.containers.create.return_value = mock_container
+
+    result = run_on_distro(
+        mock_client,
+        str(script_file),
+        "alpine:3.20",
+        packages=["curl", "ca-certificates"],
+        network="bridge",
+    )
+
+    assert result.status == DistroStatus.PASS
+    command = mock_client.containers.create.call_args.kwargs["command"]
+    assert command[:2] == ["/bin/sh", "-c"]
+    assert "Dir::Cache::archives=/tmp/opsscript-apt-archives/" in command[2]
+    assert "DPkg::Post-Invoke::=" in command[2]
+    assert "DPkg::Post-Invoke-Success::=" in command[2]
+    assert "APT::Update::Post-Invoke-Success::=" in command[2]
+    assert "apk add --no-cache curl ca-certificates" in command[2]
+    assert "exec /bin/sh -c" in command[2]
+    assert "OPSSCRIPT_GATE_SETUP_ERROR:" in command[2]
+
+
+def test_run_on_distro_package_setup_failure_is_error(tmp_path):
+    script_file = tmp_path / "test.sh"
+    script_file.write_text("#!/bin/sh\necho should-not-run\n", encoding="utf-8")
+
+    mock_client = mock.MagicMock()
+    mock_container = mock.MagicMock()
+    mock_container.status = "exited"
+    mock_container.attrs = {"State": {"ExitCode": 125}}
+    mock_container.logs.return_value = (
+        b"OPSSCRIPT_GATE_SETUP_ERROR: no supported package manager found (apt-get or apk)\n"
+    )
+    mock_client.containers.create.return_value = mock_container
+
+    result = run_on_distro(
+        mock_client, str(script_file), "scratch:latest", packages=["curl"], network="bridge"
+    )
+
+    assert result.status == DistroStatus.ERROR
+    assert result.exit_code == 125
+    assert "package setup failed" in (result.error_message or "")
+
+
+def test_package_setup_requires_network(tmp_path):
+    script_file = tmp_path / "test.sh"
+    script_file.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    result = run_on_distro(
+        mock.MagicMock(), str(script_file), "alpine:3.20", packages=["curl"], network="none"
+    )
+    assert result.status == DistroStatus.ERROR
+    assert "requires network" in (result.error_message or "")
+
+
+def test_package_setup_quotes_and_validates_names():
+    wrapped = _wrap_with_package_setup(["/bin/sh", "-c", "echo ok"], ["ca-certificates"])
+    assert "ca-certificates" in wrapped[2]
+    with pytest.raises(ValueError):
+        _wrap_with_package_setup(["/bin/sh"], ["curl;touch /tmp/pwned"])
+
+
 def test_run_on_distro_fail_mock(tmp_path):
     script_file = tmp_path / "test_fail.sh"
     script_file.write_text("#!/bin/sh\napt-get: not found\nexit 127\n", encoding="utf-8")
@@ -214,6 +364,42 @@ def test_run_on_distro_fail_mock(tmp_path):
     assert "apt-get: not found" in result.output_snippet
     assert "127" in (result.error_message or "")
     mock_container.remove.assert_called_once_with(force=True)
+
+
+def test_run_on_distro_missing_exit_code_fails_closed(tmp_path):
+    script_file = tmp_path / "unknown.sh"
+    script_file.write_text("#!/bin/sh\necho unknown\n", encoding="utf-8")
+
+    mock_client = mock.MagicMock()
+    mock_container = mock.MagicMock()
+    mock_container.status = "exited"
+    mock_container.attrs = {"State": {}}
+    mock_container.logs.return_value = b"unknown\n"
+    mock_client.containers.create.return_value = mock_container
+
+    result = run_on_distro(mock_client, str(script_file), "debian:12-slim")
+
+    assert result.status == DistroStatus.ERROR
+    assert result.exit_code is None
+    assert "without a Docker exit code" in (result.error_message or "")
+
+
+def test_run_on_distro_wait_api_error_is_not_timeout(tmp_path):
+    script_file = tmp_path / "wait-error.sh"
+    script_file.write_text("#!/bin/sh\necho wait\n", encoding="utf-8")
+
+    mock_client = mock.MagicMock()
+    mock_container = mock.MagicMock()
+    mock_container.wait.side_effect = RuntimeError("Docker daemon disconnected")
+    mock_container.logs.return_value = b"wait failed\n"
+    mock_client.containers.create.return_value = mock_container
+
+    result = run_on_distro(mock_client, str(script_file), "debian:12-slim")
+
+    assert result.status == DistroStatus.ERROR
+    assert result.status != DistroStatus.TIMED_OUT
+    assert "wait failed" in (result.error_message or "")
+    mock_container.kill.assert_not_called()
 
 
 def test_run_on_distro_timeout_kill_mock(tmp_path):
@@ -277,6 +463,30 @@ def test_reporter_terminal_table():
     assert "cmd not found" in table_output
 
 
+def test_reporter_terminal_table_handles_empty_and_long_rows():
+    empty = format_terminal_table(RunReport())
+    assert "Distro" in empty
+    assert "Result: PASSED" in empty
+
+    long_error = SingleResult(
+        "alpine:3.20", DistroStatus.FAIL, 1, 0.1, error_message="x" * 200
+    )
+    table = format_terminal_table(RunReport([long_error]))
+    assert "x" * 47 + "..." in table
+
+
+def test_publish_output_writes_and_reports_os_errors(tmp_path, capsys):
+    target = tmp_path / "reports" / "result.txt"
+    assert publish_output("hello", str(target)) is True
+    assert target.read_text(encoding="utf-8") == "hello\n"
+    assert "hello" in capsys.readouterr().out
+
+    blocked = tmp_path / "file"
+    blocked.write_text("already a file", encoding="utf-8")
+    assert publish_output("nope", str(blocked / "child.txt")) is False
+    assert "nope" in capsys.readouterr().out
+
+
 def test_reporter_github_summary():
     r1 = SingleResult("debian:12-slim", DistroStatus.PASS, 0, 1.2)
     r2 = SingleResult("ubuntu:22.04", DistroStatus.TIMED_OUT, None, 60.0, "hanging...", "Timed out")
@@ -300,6 +510,71 @@ def test_reporter_json():
     assert data["results"][0]["status"] == "PASS"
 
 
+def test_reporter_sarif_contains_failure_location_and_metadata():
+    result = SingleResult(
+        "alpine:3.20",
+        DistroStatus.FAIL,
+        127,
+        0.42,
+        diagnostic=FailureDiagnostic(
+            kind="missing_command",
+            message="apt-get: command not found",
+            command="apt-get",
+            line=4,
+            distro="alpine:3.20",
+            hint="Use apk instead of apt-get.",
+        ),
+    )
+    report = RunReport([SingleResult("debian:12-slim", DistroStatus.PASS, 0, 0.2), result])
+
+    payload = json.loads(format_sarif(report, script_path="./scripts/install.sh"))
+    assert payload["$schema"].endswith("sarif-2.1.0.json")
+    assert payload["version"] == "2.1.0"
+    finding = payload["runs"][0]["results"][0]
+    assert finding["ruleId"] == "OSG001"
+    assert finding["level"] == "error"
+    assert finding["locations"][0]["physicalLocation"]["artifactLocation"]["uri"] == "scripts/install.sh"
+    assert finding["locations"][0]["physicalLocation"]["region"]["startLine"] == 4
+    assert finding["properties"]["distribution"] == "alpine:3.20"
+    assert finding["properties"]["command"] == "apt-get"
+    assert "help" not in finding
+    assert payload["runs"][0]["tool"]["driver"]["rules"][0]["help"] == {
+        "text": "Runtime compatibility failure"
+    }
+    assert payload["runs"][0]["tool"]["driver"]["rules"][0]["helpUri"].endswith("#ci-output")
+
+
+def test_reporter_sarif_normalizes_absolute_script_paths(tmp_path):
+    script = tmp_path / "scripts" / "install.sh"
+    script.parent.mkdir()
+    script.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    result = SingleResult("alpine:3.20", DistroStatus.FAIL, 1, 0.1)
+    payload = json.loads(format_sarif(RunReport([result]), script_path=str(script)))
+    uri = payload["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+    assert not os.path.isabs(uri)
+    assert not uri.startswith("../")
+    assert uri.endswith("install.sh")
+
+
+def test_reporter_multi_sarif_keeps_script_paths():
+    report = MultiScriptReport(
+        reports={
+            "install.sh": RunReport([SingleResult("alpine:3.20", DistroStatus.FAIL, 1, 0.1)]),
+            "scripts/setup.sh": RunReport([SingleResult("debian:12-slim", DistroStatus.TIMED_OUT, None, 5.0)]),
+        },
+        total_duration=5.1,
+    )
+
+    payload = json.loads(format_multi_sarif(report))
+    results = payload["runs"][0]["results"]
+    assert len(results) == 2
+    paths = {
+        result["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+        for result in results
+    }
+    assert paths == {"install.sh", "scripts/setup.sh"}
+
+
 def test_write_github_step_summary(tmp_path):
     summary_file = tmp_path / "step_summary.md"
     r1 = SingleResult("debian:12-slim", DistroStatus.PASS, 0, 1.0)
@@ -320,6 +595,16 @@ def test_parse_matrix_argument():
     assert parse_matrix_argument(None) == DEFAULT_MATRIX
     assert parse_matrix_argument("") == DEFAULT_MATRIX
     assert parse_matrix_argument("debian:12-slim, alpine:3.20") == ["debian:12-slim", "alpine:3.20"]
+    with pytest.raises(ValueError, match="more than 32"):
+        parse_matrix_argument(",".join(f"image:{index}" for index in range(33)))
+
+
+def test_parse_packages_argument():
+    assert parse_packages_argument(["curl, ca-certificates", "tar"]) == [
+        "curl", "ca-certificates", "tar"
+    ]
+    with pytest.raises(ValueError, match="package"):
+        parse_packages_argument(["curl && touch pwned"])
 
 
 def test_cli_help(capsys):
@@ -467,6 +752,17 @@ def test_inspect_shebang_matrix(tmp_path):
     res_crlf = inspect_shebang(str(crlf_file))
     assert res_crlf.status == ShebangStatus.RECOGNIZED
     assert res_crlf.interpreter == "bash"
+
+    bom_file = tmp_path / "bom.sh"
+    bom_file.write_bytes(b"\xef\xbb\xbf#!/bin/sh\necho hi\r\n")
+    res_bom = inspect_shebang(str(bom_file))
+    assert res_bom.status == ShebangStatus.RECOGNIZED
+    prepared_bom, temp_bom = prepare_script(str(bom_file))
+    try:
+        assert open(prepared_bom, "rb").read().startswith(b"#!/bin/sh\n")
+    finally:
+        if temp_bom is not None:
+            temp_bom.close()
 
     # 3. Leading whitespace before #! must be treated as missing
     lead_space = tmp_path / "lead_space.sh"
@@ -873,6 +1169,43 @@ def test_integration_pass_basic():
 
 @pytest.mark.integration
 @pytest.mark.skipif(not is_docker_daemon_available(), reason="Docker daemon is not running or accessible")
+@pytest.mark.parametrize("image", DEFAULT_MATRIX)
+def test_integration_installer_can_write_container_filesystem(tmp_path, image):
+    script = tmp_path / "installer.sh"
+    script.write_text(
+        "#!/bin/sh\nset -eu\n"
+        "mkdir -p /usr/local/bin\n"
+        "printf 'installed' > /usr/local/bin/opsscript-probe\n"
+        "test -s /usr/local/bin/opsscript-probe\n",
+        encoding="utf-8",
+    )
+    report = run_matrix(str(script), matrix=[image], network="none", timeout=30)
+    assert report.all_passed, report.to_dict()
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not is_docker_daemon_available(), reason="Docker daemon is not running or accessible")
+@pytest.mark.parametrize("image", DEFAULT_MATRIX)
+def test_integration_package_setup(tmp_path, image):
+    script = tmp_path / "needs-curl.sh"
+    script.write_text(
+        "#!/usr/bin/env bash\nset -e\ncurl --version >/dev/null\ntar --version >/dev/null\n"
+        "test -s /etc/ssl/certs/ca-certificates.crt\n", encoding="utf-8"
+    )
+    report = run_matrix(
+        str(script),
+        matrix=[image],
+        packages=["bash", "curl", "ca-certificates", "tar"],
+        shell_mode="auto",
+        network="bridge",
+        timeout=120,
+    )
+    assert report.all_passed is True, report.to_dict()
+    assert report.results[0].status == DistroStatus.PASS
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not is_docker_daemon_available(), reason="Docker daemon is not running or accessible")
 def test_integration_fail_deps_alpine():
     fixture = os.path.join(os.path.dirname(__file__), "fixtures", "fail_deps.sh")
     report = run_matrix(fixture, matrix=["alpine:3.20"], timeout=30)
@@ -1274,6 +1607,8 @@ def test_remediation_rules_logic():
     assert "Minimal images may not include curl" in hint_curl
     hint_wget = generate_remediation_hint("debian:12-slim", "wget")
     assert "Minimal images may not include wget" in hint_wget
+    assert generate_remediation_hint("ubuntu:24.04", "curlexe") is None
+    assert "Minimal images may not include curl" in generate_remediation_hint("ubuntu:24.04", "curl.exe")
 
     # missing interpreter
     hint_interp = generate_remediation_hint(None, "/usr/bin/bash", kind="missing_interpreter")
@@ -1357,6 +1692,123 @@ def test_run_matrix_concurrency_and_order_preservation(tmp_path):
     assert [r.distro for r in report.results] == matrix
 
 
+def test_run_matrix_caps_requested_concurrency(tmp_path):
+    script_file = tmp_path / "cap.sh"
+    script_file.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    observed: dict[str, int] = {}
+
+    class StopExecutor:
+        def __init__(self, max_workers):
+            observed["max_workers"] = max_workers
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def submit(self, *args, **kwargs):
+            raise RuntimeError("stop after checking worker cap")
+
+    with mock.patch("opsscript_gate.runner.ThreadPoolExecutor", StopExecutor):
+        with pytest.raises(RuntimeError, match="worker cap"):
+            run_matrix(
+                str(script_file),
+                    matrix=[f"distro_{i}" for i in range(MAX_CONCURRENT_JOBS)],
+                jobs=100_000,
+                client=mock.MagicMock(),
+            )
+
+    assert observed["max_workers"] == MAX_CONCURRENT_JOBS
+    assert observed["max_workers"] <= MAX_CONCURRENT_JOBS
+
+
+def test_run_matrix_repeat_marks_flaky_runtime(tmp_path):
+    script_file = tmp_path / "flaky.sh"
+    script_file.write_text("#!/bin/sh\necho maybe\n", encoding="utf-8")
+    calls: dict[str, int] = {}
+
+    def fake_run_on_distro(**kwargs):
+        distro = kwargs["distro"]
+        calls[distro] = calls.get(distro, 0) + 1
+        if calls[distro] == 1:
+            return SingleResult(distro, DistroStatus.PASS, 0, 0.1)
+        return SingleResult(distro, DistroStatus.FAIL, 1, 0.2, error_message="intermittent failure")
+
+    with mock.patch("opsscript_gate.runner.run_on_distro", side_effect=fake_run_on_distro):
+        report = run_matrix(
+            script_path=str(script_file),
+            matrix=["alpine:3.20"],
+            repeat=2,
+            client=mock.MagicMock(),
+        )
+
+    result = report.results[0]
+    assert result.status == DistroStatus.FLAKY
+    assert result.attempts == 2
+    assert result.passed_attempts == 1
+    assert result.failed_attempts == 1
+    assert result.to_dict()["flaky"] is True
+    assert report.all_passed is False
+
+
+def test_run_matrix_repeat_keeps_actionable_diagnostic(tmp_path):
+    script_file = tmp_path / "flaky-diagnostic.sh"
+    script_file.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    calls = {"count": 0}
+
+    def fake_run_on_distro(**kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return SingleResult("alpine:3.20", DistroStatus.ERROR, None, 0.1, error_message="daemon reset")
+        if calls["count"] == 2:
+            return SingleResult(
+                "alpine:3.20", DistroStatus.FAIL, 127, 0.1,
+                diagnostic=FailureDiagnostic(
+                    kind="missing_command", message="command not found: curl", command="curl", line=4
+                ),
+            )
+        return SingleResult("alpine:3.20", DistroStatus.PASS, 0, 0.1)
+
+    with mock.patch("opsscript_gate.runner.run_on_distro", side_effect=fake_run_on_distro):
+        report = run_matrix(
+            str(script_file), matrix=["alpine:3.20"], repeat=3, client=mock.MagicMock()
+        )
+
+    result = report.results[0]
+    assert result.status == DistroStatus.FLAKY
+    assert result.diagnostic is not None
+    assert result.diagnostic.command == "curl"
+    assert result.exit_code == 127
+
+
+def test_run_matrix_rejects_non_positive_repeat(tmp_path):
+    script_file = tmp_path / "script.sh"
+    script_file.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="repeat"):
+        run_matrix(str(script_file), matrix=["alpine:3.20"], repeat=0, client=mock.MagicMock())
+    with pytest.raises(ValueError, match="repeat"):
+        run_matrix(str(script_file), matrix=["alpine:3.20"], repeat=1.5, client=mock.MagicMock())
+    with pytest.raises(ValueError, match="must not exceed"):
+        run_matrix(str(script_file), matrix=["alpine:3.20"], repeat=21, client=mock.MagicMock())
+    with pytest.raises(ValueError, match="timeout must not exceed"):
+        run_matrix(str(script_file), matrix=["alpine:3.20"], timeout=3601, client=mock.MagicMock())
+
+
+def test_run_matrix_rejects_invalid_matrix_values(tmp_path):
+    script_file = tmp_path / "script.sh"
+    script_file.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    client = mock.MagicMock()
+    with pytest.raises(ValueError, match="matrix"):
+        run_matrix(str(script_file), matrix="alpine:3.20", client=client)
+    with pytest.raises(ValueError, match="at least one"):
+        run_matrix(str(script_file), matrix=iter(()), client=client)
+    with pytest.raises(ValueError, match="nonempty"):
+        run_matrix(str(script_file), matrix=["  "], client=client)
+    with pytest.raises(ValueError, match="more than 32"):
+        run_matrix(str(script_file), matrix=[f"image:{index}" for index in range(33)], client=client)
+
+
 def test_run_on_distro_resource_limits(tmp_path):
     """Verify mem_limit, pids_limit, and network_mode parameters are forwarded to Docker container."""
     script_file = tmp_path / "test_limits.sh"
@@ -1382,6 +1834,9 @@ def test_run_on_distro_resource_limits(tmp_path):
     assert create_kwargs["mem_limit"] == "128m"
     assert create_kwargs["pids_limit"] == 64
     assert create_kwargs["network_mode"] == "none"
+    assert create_kwargs["nano_cpus"] == MAX_NANO_CPUS
+    assert create_kwargs["read_only"] is False
+    assert create_kwargs["log_config"]["Config"] == {"max-size": "1m", "max-file": "2"}
 
 
 def test_script_discovery(tmp_path):
@@ -1572,6 +2027,14 @@ def test_collect_container_logs_fallback_handling():
     assert container.non_streaming_called is False
 
 
+def test_collect_container_logs_zero_limit_is_empty():
+    class StaticContainer:
+        def logs(self, **kwargs):
+            return b"unbounded payload"
+
+    assert collect_container_logs(StaticContainer(), max_bytes=0) == ""
+
+
 def test_sanitize_log_output_neutralizes_workflow_commands():
     """
     Verify untrusted container logs cannot forge GitHub Actions workflow commands.
@@ -1643,6 +2106,13 @@ def test_sanitize_log_output_ansi_and_control_chars():
     assert "Unicode: 成功 ✅ 日本語" in sanitized
     assert "Title Hijack" not in sanitized
     assert "Red Alert" in sanitized
+
+
+def test_sanitize_log_output_removes_c1_and_bidi_controls():
+    sanitized = sanitize_log_output("safe\x9b31mRED\u202eTXT\u2066TAIL")
+    assert "\x9b" not in sanitized
+    assert "\u202e" not in sanitized
+    assert "\u2066" not in sanitized
 
 
 def test_prepare_script_bounded_streaming_crlf(tmp_path):
@@ -1759,7 +2229,7 @@ def test_reporter_rendering_adversarial_payloads():
 
     # Table structure remains intact (no raw unescaped pipes breaking the row)
     assert "`hack'script.sh\\|`" in summary_md or "\\|" in summary_md
-    assert "<\\/details>" in summary_md
+    assert "&lt;/details&gt;" in summary_md or "<\\/details>" in summary_md
     assert "</details></details>" not in summary_md
     assert "\\[Fake Link\\]\\(http://evil.com\\)" in summary_md or "Fake Link" in summary_md
 
@@ -1882,12 +2352,14 @@ def test_reporter_copyable_markdown_fence_injection():
     summary_md = format_markdown_compatibility_card(report, "test.sh")
 
     # Must NOT contain an unescaped </details> inside the copyable block that closes the outer details
-    assert "<\\/details>" in summary_md
+    assert "&lt;/details&gt;" in summary_md
     # All raw </details> occurrences in the summary must be legitimate HTML container closures (exactly 2)
     raw_details_close = [m.start() for m in re.finditer(r"(?<!\\)</details>", summary_md)]
     assert len(raw_details_close) == 2, f"Unescaped closing tag found in summary: {summary_md}"
-    # Code fence should dynamically scale to at least 4 backticks
-    assert "````markdown" in summary_md or "`````markdown" in summary_md
+    # The copyable block must still render as one code fence despite the payload.
+    rendered = MarkdownIt("commonmark", {"html": True}).enable("table").render(summary_md)
+    assert rendered.count('<pre><code class="language-markdown">') == 1
+    assert rendered.count("</details>") == 2
 
 
 def test_reporter_distro_cell_escaping():
@@ -1906,17 +2378,73 @@ def test_reporter_distro_cell_escaping():
     matching_rows = [line for line in card.splitlines() if "ubuntu:24.04" in line]
     assert len(matching_rows) == 2, f"Expected 2 matching rows (matrix and copyable), got: {matching_rows}"
 
-    # Row 1: compatibility matrix table row (5 columns -> 6 delimiters)
     matrix_row = matching_rows[0]
     matrix_delims = [ch for i, ch in enumerate(matrix_row) if ch == "|" and (i == 0 or matrix_row[i-1] != "\\")]
     assert len(matrix_delims) == 6, f"Matrix table row was split by unescaped pipe: {matrix_row}"
     assert "`ubuntu:24.04\\|FAKE`" in matrix_row
 
-    # Row 2: copyable markdown matrix row (4 columns -> 5 delimiters)
     copy_row = matching_rows[1]
     copy_delims = [ch for i, ch in enumerate(copy_row) if ch == "|" and (i == 0 or copy_row[i-1] != "\\")]
     assert len(copy_delims) == 5, f"Copyable table row was split by unescaped pipe: {copy_row}"
     assert "`ubuntu:24.04\\|FAKE`" in copy_row
+
+
+def test_reporter_table_escapes_html_payloads():
+    result = SingleResult(
+        distro="alpine:3.20",
+        status=DistroStatus.FAIL,
+        exit_code=1,
+        duration=0.1,
+        error_message="<img src=x onerror=alert(1)>",
+    )
+    card = format_markdown_compatibility_card(RunReport([result]), "test.sh")
+    assert "<img" not in card
+    assert "&lt;img" in card
+
+
+def test_reporter_table_escapes_markdown_links_in_error_text():
+    result = SingleResult(
+        distro="alpine:3.20",
+        status=DistroStatus.FAIL,
+        exit_code=1,
+        duration=0.1,
+        error_message="[click](https://evil.example) *bold*",
+    )
+    card = format_markdown_compatibility_card(RunReport([result]), "test.sh")
+    assert "\\[click\\]\\(https://evil.example\\)" in card
+    rendered = MarkdownIt("commonmark", {"html": True}).enable("table").render(card)
+    assert "<a " not in rendered
+
+
+def test_reporter_rendered_diagnostics_preserve_literal_names_and_trusted_markup():
+    result = SingleResult(
+        "registry/team/my_image:1", DistroStatus.FAIL, 127, 0.1,
+        diagnostic=FailureDiagnostic(
+            "missing_command", "command not found: foo_bar", command="foo_bar", line=1,
+            hint="Install [tool](https://evil.example) <img src=x> and try again.",
+        ),
+    )
+    card = format_markdown_compatibility_card(RunReport([result]), "test.sh")
+    rendered = MarkdownIt("commonmark", {"html": True}).enable("table").render(card)
+    assert "<code>registry/team/my_image:1</code>" in rendered
+    assert "<code>foo_bar</code>" in rendered
+    assert "<br>" in rendered
+    assert "<img " not in rendered
+    assert "<a " not in rendered
+
+
+def test_reporter_escapes_control_characters_in_direct_text_inputs():
+    assert "\u202e" not in escape_markdown_text("safe\u202evalue")
+    assert "\x9b" not in escape_github_data("safe\x9bvalue")
+    sarif = json.loads(
+        format_sarif(
+            RunReport([SingleResult("alpine\u202e:3.20", DistroStatus.FAIL, 1, 0.1)]),
+            script_path="scripts/\u202einstall.sh",
+        )
+    )
+    serialized = json.dumps(sarif, ensure_ascii=False)
+    assert "\u202e" not in serialized
+
 
 
 def test_run_matrix_prepare_script_failure_semantics(tmp_path):
@@ -1945,3 +2473,185 @@ def test_run_matrix_prepare_script_failure_semantics(tmp_path):
     with mock.patch("opsscript_gate.runner.prepare_script", side_effect=PermissionError("Cannot read script")):
         exit_code = main(["run", str(script_path)])
         assert exit_code == 1
+
+
+def test_is_ignored_path_dot_slash_and_hidden():
+    from opsscript_gate.discovery import _is_ignored_path
+    assert _is_ignored_path("./scripts/install.sh") is False
+    assert _is_ignored_path("./install.sh") is False
+    assert _is_ignored_path("install.sh") is False
+    assert _is_ignored_path(".git/hooks/pre-commit") is True
+    assert _is_ignored_path(".hidden/test.sh") is True
+    assert _is_ignored_path("subdir/.env.sh") is True
+
+
+def test_is_wait_timeout_error_cause_chain():
+    import socket
+    from opsscript_gate.runner import _is_wait_timeout_error
+
+    # Direct socket timeout
+    assert _is_wait_timeout_error(socket.timeout("timed out")) is True
+
+    # Wrapped timeout via __cause__
+    class ReadTimeout(Exception):
+        pass
+
+    wrapped = RuntimeError("Docker failed")
+    wrapped.__cause__ = ReadTimeout("read timeout")
+    assert _is_wait_timeout_error(wrapped) is True
+
+    # Non-timeout error
+    assert _is_wait_timeout_error(ValueError("bad value")) is False
+
+
+def test_cli_output_rejects_existing_directory_early(tmp_path, capsys):
+    out_dir = tmp_path / "reports_dir"
+    out_dir.mkdir()
+    script = tmp_path / "test.sh"
+    script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+
+    with mock.patch("opsscript_gate.cli.run_checked_matrix") as mock_run:
+        ret = main(["run", str(script), "--output", str(out_dir)])
+        assert ret == 1
+        mock_run.assert_not_called()
+    stderr = capsys.readouterr().err
+    assert "must name a file, not an existing directory" in stderr
+
+
+def test_remediation_enterprise_distro_package_rules():
+    from opsscript_gate.remediation import generate_remediation_hint
+
+    # Debian with yum
+    hint = generate_remediation_hint(distro="debian:12-slim", command="yum")
+    assert hint is not None
+    assert "APT" in hint and "yum" in hint
+
+    # Alpine with dnf
+    hint = generate_remediation_hint(distro="alpine:3.20", command="dnf")
+    assert hint is not None
+    assert "apk" in hint and "dnf" in hint
+
+    # Fedora with apt-get
+    hint = generate_remediation_hint(distro="fedora:40", command="apt-get")
+    assert hint is not None
+    assert "RHEL/Fedora" in hint and "dnf" in hint
+
+
+def test_remediation_curl_wget_path_and_sudo():
+    from opsscript_gate.remediation import generate_remediation_hint
+
+    # Full path curl
+    hint_curl = generate_remediation_hint(distro="debian:12-slim", command="/usr/bin/curl")
+    assert hint_curl is not None
+    assert "curl" in hint_curl
+
+    # Full path wget
+    hint_wget = generate_remediation_hint(distro="alpine:3.20", command="/usr/bin/wget")
+    assert hint_wget is not None
+    assert "wget" in hint_wget
+
+    # Sudo in minimal container
+    hint_sudo = generate_remediation_hint(distro="debian:12-slim", command="sudo")
+    assert hint_sudo is not None
+    assert "sudo" in hint_sudo and "root" in hint_sudo
+
+    # Sudo with path
+    hint_sudo_path = generate_remediation_hint(distro="ubuntu:24.04", command="/usr/bin/sudo")
+    assert hint_sudo_path is not None
+    assert "sudo" in hint_sudo_path
+
+
+def test_cli_rejects_unreadable_script_preflight(tmp_path, capsys):
+    script = tmp_path / "unreadable.sh"
+    script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+
+    with mock.patch("builtins.open", side_effect=PermissionError("Access denied")):
+        with mock.patch("opsscript_gate.cli.run_checked_matrix") as mock_matrix:
+            exit_code = main(["run", str(script)])
+            assert exit_code == 1
+            mock_matrix.assert_not_called()
+
+    err = capsys.readouterr().err
+    assert "Error: Cannot read script" in err
+    assert "Access denied" in err
+
+
+def test_sarif_and_annotations_path_traversal_hardened():
+    from opsscript_gate.reporter import _sarif_path, format_github_annotations
+    from opsscript_gate.models import DistroStatus, RunReport, SingleResult
+
+    # 1. Non-leading path traversal in _sarif_path
+    assert _sarif_path("subdir/../../outside.sh") == "outside.sh"
+    assert _sarif_path("../../secret.sh") == "secret.sh"
+    assert _sarif_path("scripts/./install.sh") == "scripts/install.sh"
+
+    # 2. Path traversal in format_github_annotations
+    r1 = SingleResult("debian:12-slim", DistroStatus.FAIL, 1, 0.5, error_message="failed")
+    report = RunReport([r1])
+    anns = format_github_annotations(report, script_path="subdir/../../outside.sh")
+    assert len(anns) == 1
+    assert "file=outside.sh" in anns[0]
+    assert "../" not in anns[0]
+
+
+def test_cli_output_protects_git_and_critical_files(tmp_path, capsys):
+    script = tmp_path / "test.sh"
+    script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+
+    # 1. Rejects output inside .git
+    with mock.patch("opsscript_gate.cli.run_checked_matrix") as mock_matrix:
+        exit_code = main(["run", str(script), "--output", ".git/config"])
+        assert exit_code == 1
+        mock_matrix.assert_not_called()
+    assert "inside .git directory" in capsys.readouterr().err
+
+    # 2. Rejects overwriting pyproject.toml
+    with mock.patch("opsscript_gate.cli.run_checked_matrix") as mock_matrix:
+        exit_code = main(["run", str(script), "--output", "pyproject.toml"])
+        assert exit_code == 1
+        mock_matrix.assert_not_called()
+    assert "must not overwrite a target script or configuration" in capsys.readouterr().err
+
+
+def test_runner_oom_killed_detection(tmp_path):
+    from opsscript_gate.runner import run_on_distro
+
+    script = tmp_path / "mem_hog.sh"
+    script.write_text("#!/bin/sh\nexit 137\n", encoding="utf-8")
+
+    mock_client = mock.MagicMock()
+    mock_container = mock.MagicMock()
+    mock_container.wait.return_value = {"StatusCode": 137}
+    mock_container.attrs = {"State": {"ExitCode": 137, "OOMKilled": True}}
+    mock_container.logs.return_value = b""
+    mock_client.containers.create.return_value = mock_container
+
+    res = run_on_distro(
+        mock_client,
+        str(script),
+        "debian:12-slim",
+        mem_limit="128m",
+    )
+    assert res.status == DistroStatus.FAIL
+    assert res.exit_code == 137
+    assert "exceeded memory limit" in (res.error_message or "")
+    assert "OOM killer" in (res.error_message or "")
+    assert "128m" in (res.error_message or "")
+
+
+def test_matches_exclude_leading_slash_and_dotdot():
+    from opsscript_gate.discovery import _matches_exclude, _is_ignored_path
+
+    # Leading slash pattern
+    assert _matches_exclude("tests/foo.sh", ["/tests/*"]) is True
+    assert _matches_exclude("scripts/run.sh", ["/scripts/run.sh"]) is True
+    assert _matches_exclude("scripts/run.sh", ["./scripts/run.sh"]) is True
+
+    # .. traversal in _is_ignored_path
+    assert _is_ignored_path("../outside.sh") is True
+    assert _is_ignored_path("subdir/../outside.sh") is True
+    assert _is_ignored_path("./normal/script.sh") is False
+
+
+
+

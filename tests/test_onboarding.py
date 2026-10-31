@@ -6,8 +6,9 @@ import pytest
 
 from opsscript_gate.cli import main
 from opsscript_gate.config import CONFIG_NAME, init_project, load_config
-from opsscript_gate.discovery import discover_scripts, is_shell_script
+from opsscript_gate.discovery import discover_changed_scripts, discover_scripts, is_shell_script
 from opsscript_gate.models import RunReport, SingleResult, DistroStatus
+from opsscript_gate.runner import DockerDaemonError
 
 
 @pytest.fixture
@@ -35,6 +36,37 @@ def test_init_preview_and_no_overwrite(project, capsys):
     assert Path(CONFIG_NAME).read_bytes() == original
 
 
+def test_doctor_reports_local_prerequisites(project, capsys):
+    with patch("opsscript_gate.cli.get_docker_client"):
+        assert main(["doctor"]) == 0
+    output = capsys.readouterr().out
+    assert "OpsScript Gate doctor" in output
+    assert "[PASS] python" in output
+    assert "[PASS] docker" in output
+    assert "No project config (optional)" in output
+
+
+def test_doctor_json_reports_docker_failure(project, capsys):
+    with patch(
+        "opsscript_gate.cli.get_docker_client",
+        side_effect=DockerDaemonError("Docker is not running"),
+    ):
+        assert main(["doctor", "--format", "json"]) == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report["status"] == "FAIL"
+    assert next(check for check in report["checks"] if check["name"] == "docker")["ok"] is False
+
+
+def test_doctor_rejects_invalid_project_config(project, capsys):
+    Path(CONFIG_NAME).write_text('{"timeout":')
+    with patch("opsscript_gate.cli.get_docker_client"):
+        assert main(["doctor", "--format", "json"]) == 1
+    report = json.loads(capsys.readouterr().out)
+    check = next(item for item in report["checks"] if item["name"] == "project")
+    assert check["ok"] is False
+    assert "Invalid" in check["detail"]
+
+
 def test_init_existing_workflow_leaves_config_absent(project):
     workflow = project / ".github/workflows/opsscript-gate.yml"
     workflow.parent.mkdir(parents=True)
@@ -47,11 +79,20 @@ def test_init_existing_workflow_leaves_config_absent(project):
 
 @pytest.mark.parametrize("config", [[], {"typo": 1}, {"timeout": True},
     {"jobs": 0}, {"exclude": "tests/*"}, {"shell": "fish"}, {"network": "host"},
-    {"preset": "unknown"}, {"matrix": "alpine", "preset": "minimal"}])
+    {"preset": "unknown"}, {"matrix": "alpine", "preset": "minimal"},
+    {"matrix": ","}, {"mem_limit": "0"}, {"mem_limit": "unlimited"}, {"repeat": 21}, {"timeout": 3601},
+    {"packages": "curl"}, {"packages": ["curl; touch pwned"]}])
 def test_invalid_config(project, config):
     Path(CONFIG_NAME).write_text(json.dumps(config))
     with patch("opsscript_gate.cli.run_matrix") as run:
         assert main(["run", "--dry-run"]) == 1
+        run.assert_not_called()
+
+
+def test_matrix_count_limit(project):
+    matrix = ",".join(f"image:{index}" for index in range(33))
+    with patch("opsscript_gate.cli.run_matrix") as run:
+        assert main(["run", "--dry-run", "--matrix", matrix]) == 1
         run.assert_not_called()
 
 
@@ -66,6 +107,34 @@ def test_config_cli_precedence_and_saved_plan(project, capsys):
     assert plan["timeout"] == 9
 
 
+def test_packages_are_forwarded_and_visible_in_dry_run(project, capsys):
+    assert main([
+        "run", "install.sh", "--dry-run", "--format", "json",
+        "--packages", "curl,ca-certificates", "--packages", "tar",
+    ]) == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["packages"] == ["curl", "ca-certificates", "tar"]
+
+
+def test_repeat_is_forwarded_and_visible_in_dry_run(project, capsys):
+    assert main(["run", "install.sh", "--dry-run", "--format", "json", "--repeat", "3"]) == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["repeat"] == 3
+
+
+def test_oversized_config_is_rejected(project):
+    Path(CONFIG_NAME).write_text("{" + "\"x\":1," * 50000 + "\"timeout\":60}")
+    with patch("opsscript_gate.cli.run_matrix") as run:
+        assert main(["run", "--dry-run"]) == 1
+        run.assert_not_called()
+
+
+def test_packages_reject_offline_network(project):
+    with patch("opsscript_gate.cli.run_matrix") as run:
+        assert main(["run", "install.sh", "--packages", "curl", "--network", "none"]) == 1
+        run.assert_not_called()
+
+
 def test_preset_overrides_config_matrix(project, capsys):
     Path(CONFIG_NAME).write_text('{"matrix": "custom:1"}')
     assert main(["run", "--dry-run", "--preset", "ubuntu", "--format", "json"]) == 0
@@ -76,6 +145,8 @@ def test_discovery_limit_and_exclusions(project):
     with pytest.raises(ValueError, match="no scripts were executed"):
         discover_scripts(max_scripts=1)
     assert discover_scripts(max_scripts=1, exclude=["tests/*"]) == ["./install.sh"]
+    assert discover_scripts(max_scripts=1, exclude=["./install.sh", "tests/*"]) == []
+    assert discover_scripts(max_scripts=1, exclude=[r"tests\fail.sh"]) == ["./install.sh"]
     with patch("opsscript_gate.cli.run_matrix") as run:
         assert main(["run", "--max-scripts", "1"]) == 1
         run.assert_not_called()
@@ -96,8 +167,112 @@ def test_discovery_stops_at_first_overflow(tmp_path, monkeypatch):
     assert len(checked) == 3
 
 
-@pytest.mark.parametrize("flags", [["--jobs", "0"], ["--timeout", "-1"],
-    ["--pids-limit", "0"], ["--network", "host"], ["--matrix", ","],
+def test_changed_discovery_uses_git_paths_and_filters_candidates(tmp_path):
+    (tmp_path / "install.sh").write_text("#!/bin/sh\necho ok\n")
+    (tmp_path / "README.md").write_text("docs\n")
+    completed = type("Completed", (), {"stdout": b"install.sh\0README.md\0", "stderr": b""})()
+    with patch("opsscript_gate.discovery.subprocess.run", return_value=completed) as run:
+        result = discover_changed_scripts(str(tmp_path), since="origin/main")
+    assert result == ["./install.sh"]
+    run.assert_called_once()
+    assert "origin/main...HEAD" in run.call_args.args[0]
+
+
+def test_changed_discovery_matches_dot_slash_exclusions(tmp_path):
+    (tmp_path / "install.sh").write_text("#!/bin/sh\necho ok\n")
+    completed = type("Completed", (), {"stdout": b"install.sh\0", "stderr": b""})()
+    with patch("opsscript_gate.discovery.subprocess.run", return_value=completed):
+        assert discover_changed_scripts(str(tmp_path), exclude=["./install.sh"]) == []
+
+
+def test_changed_discovery_matches_normal_discovery_ignored_paths(tmp_path):
+    (tmp_path / "visible.sh").write_text("#!/bin/sh\necho ok\n")
+    (tmp_path / ".env.sh").write_text("#!/bin/sh\necho hidden\n")
+    (tmp_path / ".github").mkdir()
+    (tmp_path / ".github/hook.sh").write_text("#!/bin/sh\necho workflow\n")
+    completed = type(
+        "Completed",
+        (),
+        {"stdout": b"visible.sh\0.env.sh\0.github/hook.sh\0", "stderr": b""},
+    )()
+    with patch("opsscript_gate.discovery.subprocess.run", return_value=completed):
+        assert discover_changed_scripts(str(tmp_path), since="origin/main") == ["./visible.sh"]
+
+
+def test_discovery_recognizes_bom_shebang_without_extension(tmp_path):
+    script = tmp_path / "bin-script"
+    script.write_bytes(b"\xef\xbb\xbf#!/bin/sh\necho ok\n")
+    assert discover_scripts(str(tmp_path)) == ["./bin-script"]
+
+
+def test_discovery_skips_hidden_shell_files(tmp_path):
+    (tmp_path / ".env.sh").write_text("#!/bin/sh\necho hidden\n")
+    (tmp_path / "visible.sh").write_text("#!/bin/sh\necho visible\n")
+    assert discover_scripts(str(tmp_path)) == ["./visible.sh"]
+
+
+def test_dry_run_repeat_count_is_included(project, capsys):
+    assert main(["run", "install.sh", "--dry-run", "--format", "json", "--repeat", "3"]) == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["executions"] == 12
+
+
+def test_empty_changed_json_is_machine_readable(project, capsys):
+    with patch("opsscript_gate.cli.discover_changed_scripts", return_value=[]):
+        assert main(["run", "--changed-since", "HEAD^", "--format", "json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["skipped"] is True
+    assert report["scripts"] == []
+
+
+def test_hardlink_output_cannot_overwrite_target(project, tmp_path, capsys):
+    alias = tmp_path / "install-alias.txt"
+    try:
+        alias.hardlink_to(project / "install.sh")
+    except (OSError, NotImplementedError):
+        pytest.skip("Host does not support hard links")
+    original = (project / "install.sh").read_bytes()
+    assert main(["run", "install.sh", "--dry-run", "--output", str(alias)]) == 1
+    capsys.readouterr()
+    assert (project / "install.sh").read_bytes() == original
+
+
+def test_multi_script_json_does_not_include_github_annotations(project, capsys, monkeypatch):
+    report = RunReport([SingleResult("alpine:3.20", DistroStatus.FAIL, 1, 0.1, error_message="failed")])
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    with patch("opsscript_gate.cli.discover_scripts", return_value=["install.sh", "tests/fail.sh"]), \
+         patch("opsscript_gate.cli.run_checked_matrix", return_value=report):
+        assert main(["run", "--format", "json"]) == 1
+    output = capsys.readouterr().out
+    assert output.lstrip().startswith("{")
+    assert "::error" not in output
+
+
+@pytest.mark.parametrize("revision", ["", "--output=bad", "origin/main bad"])
+def test_changed_discovery_rejects_invalid_revision(tmp_path, revision):
+    with pytest.raises(ValueError, match="changed-since"):
+        discover_changed_scripts(str(tmp_path), since=revision)
+
+
+def test_changed_discovery_reports_empty_selection_as_success(project, monkeypatch, capsys):
+    monkeypatch.setattr("opsscript_gate.cli.discover_changed_scripts", lambda *args, **kwargs: [])
+    assert main(["run", "--changed-since", "origin/main"]) == 0
+    assert "No changed shell scripts" in capsys.readouterr().out
+
+
+def test_changed_discovery_preview_includes_revision(project, monkeypatch, capsys):
+    monkeypatch.setattr(
+        "opsscript_gate.cli.discover_changed_scripts",
+        lambda *args, **kwargs: ["./install.sh"],
+    )
+    assert main(["run", "--changed-since", "origin/main", "--dry-run", "--format", "json"]) == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["changed_since"] == "origin/main"
+    assert plan["scripts"] == ["./install.sh"]
+
+
+@pytest.mark.parametrize("flags", [["--jobs", "0"], ["--timeout", "-1"], ["--timeout", "3601"], ["--repeat", "21"],
+    ["--pids-limit", "0"], ["--repeat", "0"], ["--network", "host"], ["--matrix", ","],
     ["--matrix", "alpine", "--preset", "minimal"], ["--config", "missing.json"]])
 def test_invalid_cli_before_execution(project, flags):
     with patch("opsscript_gate.cli.run_matrix") as run:

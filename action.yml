@@ -1,5 +1,5 @@
 name: 'OpsScript Gate'
-description: 'Run Linux shell scripts across Debian, Ubuntu and Alpine before release to catch runtime compatibility failures'
+description: 'Cross-distro shell script compatibility and portability checker for Debian, Ubuntu, and Alpine. Runs real containers to diagnose command not found.'
 author: 'Mresyzz'
 branding:
   icon: 'shield'
@@ -11,7 +11,7 @@ inputs:
     required: false
     default: ''
   matrix:
-    description: 'Comma-separated container images to test (e.g. debian:12-slim,ubuntu:22.04,ubuntu:24.04,alpine:3.20)'
+    description: 'Comma-separated container images to test (maximum: 32; e.g. debian:12-slim,ubuntu:22.04,ubuntu:24.04,alpine:3.20)'
     required: false
     default: ''
   jobs:
@@ -19,11 +19,15 @@ inputs:
     required: false
     default: ''
   timeout:
-    description: 'Hard timeout in seconds per container (default: 60)'
+    description: 'Hard timeout in seconds per container (default: 60, maximum: 3600)'
+    required: false
+    default: ''
+  repeat:
+    description: 'Repeat each distribution run to detect flaky runtime behavior (default: 1, maximum: 20)'
     required: false
     default: ''
   format:
-    description: 'Output report format: table, markdown, or json'
+    description: 'Output report format: table, markdown, json, or sarif'
     required: false
     default: ''
   shell:
@@ -40,6 +44,10 @@ inputs:
     default: ''
   network:
     description: "Container network mode: 'bridge' or 'none' (default: bridge)"
+    required: false
+    default: ''
+  packages:
+    description: 'Optional comma- or newline-separated packages to install before running (requires network=bridge)'
     required: false
     default: ''
 
@@ -67,6 +75,10 @@ inputs:
     description: 'Save a report file for upload-artifact or other tooling'
     required: false
     default: ''
+  changed-since:
+    description: 'Only test shell scripts changed between this Git revision and HEAD'
+    required: false
+    default: ''
 
 runs:
   using: 'composite'
@@ -88,17 +100,20 @@ runs:
         INPUT_MATRIX: ${{ inputs.matrix }}
         INPUT_JOBS: ${{ inputs.jobs }}
         INPUT_TIMEOUT: ${{ inputs.timeout }}
+        INPUT_REPEAT: ${{ inputs.repeat }}
         INPUT_FORMAT: ${{ inputs.format }}
         INPUT_SHELL: ${{ inputs.shell }}
         INPUT_MEM_LIMIT: ${{ inputs.mem-limit }}
         INPUT_PIDS_LIMIT: ${{ inputs.pids-limit }}
         INPUT_NETWORK: ${{ inputs.network }}
+        INPUT_PACKAGES: ${{ inputs.packages }}
         INPUT_CONFIG: ${{ inputs.config }}
         INPUT_PRESET: ${{ inputs.preset }}
         INPUT_EXCLUDE: ${{ inputs.exclude }}
         INPUT_MAX_SCRIPTS: ${{ inputs.max-scripts }}
         INPUT_DRY_RUN: ${{ inputs.dry-run }}
         INPUT_OUTPUT: ${{ inputs.output }}
+        INPUT_CHANGED_SINCE: ${{ inputs.changed-since }}
       run: |
         ARGS=("run")
         if [ -n "$INPUT_SCRIPT_PATH" ]; then
@@ -106,24 +121,28 @@ runs:
         fi
         # Only explicit inputs override project configuration.
         [ -z "$INPUT_TIMEOUT" ] || ARGS+=(--timeout "$INPUT_TIMEOUT")
+        [ -z "$INPUT_REPEAT" ] || ARGS+=(--repeat "$INPUT_REPEAT")
         [ -z "$INPUT_FORMAT" ] || ARGS+=(--format "$INPUT_FORMAT")
         [ -z "$INPUT_SHELL" ] || ARGS+=(--shell "$INPUT_SHELL")
         [ -z "$INPUT_MEM_LIMIT" ] || ARGS+=(--mem-limit "$INPUT_MEM_LIMIT")
         [ -z "$INPUT_PIDS_LIMIT" ] || ARGS+=(--pids-limit "$INPUT_PIDS_LIMIT")
         [ -z "$INPUT_NETWORK" ] || ARGS+=(--network "$INPUT_NETWORK")
+        [ -z "$INPUT_PACKAGES" ] || ARGS+=(--packages "$INPUT_PACKAGES")
         [ -z "$INPUT_MATRIX" ] || ARGS+=(--matrix "$INPUT_MATRIX")
         [ -z "$INPUT_JOBS" ] || ARGS+=(--jobs "$INPUT_JOBS")
         [ -z "$INPUT_CONFIG" ] || ARGS+=(--config "$INPUT_CONFIG")
         [ -z "$INPUT_PRESET" ] || ARGS+=(--preset "$INPUT_PRESET")
         [ -z "$INPUT_MAX_SCRIPTS" ] || ARGS+=(--max-scripts "$INPUT_MAX_SCRIPTS")
         [ -z "$INPUT_OUTPUT" ] || ARGS+=(--output "$INPUT_OUTPUT")
+        [ -z "$INPUT_CHANGED_SINCE" ] || ARGS+=(--changed-since "$INPUT_CHANGED_SINCE")
         while IFS= read -r pattern; do
           pattern="${pattern%$'\r'}"
           [ -z "$pattern" ] || ARGS+=("--exclude" "$pattern")
         done <<< "$INPUT_EXCLUDE"
-        if [ "$INPUT_DRY_RUN" = "true" ]; then
+        DRY_RUN_VALUE="$(printf '%s' "$INPUT_DRY_RUN" | tr '[:upper:]' '[:lower:]')"
+        if [ "$DRY_RUN_VALUE" = "true" ]; then
           ARGS+=("--dry-run")
-        elif [ "$INPUT_DRY_RUN" != "false" ]; then
+        elif [ "$DRY_RUN_VALUE" != "false" ]; then
           echo "dry-run must be true or false" >&2
           exit 1
         fi
